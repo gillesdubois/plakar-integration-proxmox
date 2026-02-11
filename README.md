@@ -36,7 +36,8 @@ The configuration parameters are as follows:
     - `stop` : Proxmox will stop the VM / CT in order to perform the backup
 - `node` (optional): Proxmox node to target for restore/upload operations (required if your cluster has multiple nodes)
 - `cleanup` (optional): When `true`, delete the vzdump file from Proxmox storage after Plakar has read it or after restore (defaults to `false`)
-- `restore_force` (optional): When `true`, the exporter uses force-restore to overwrite an existing VM/CT with the same ID (defaults to `false`)
+
+Restores always stop the target VM/CT first and use force-restore to overwrite an existing VM/CT with the same ID.
 
 ## Backup selection options
 
@@ -66,13 +67,13 @@ $ plakar at /tmp/example backup -o all @myProxmoxHypervisorSrc
 $ plakar at /tmp/example backup -o vmid=101 -o cleanup=true @myProxmoxHypervisorSrc 
 
 # Configure a Proxmox local destination
-$ plakar destination add myProxmoxHypervisorLocal proxmox://10.0.0.10 mode=local restore_force
+$ plakar destination add myProxmoxHypervisorLocal proxmox://10.0.0.10 mode=local
 
 # Configure a Proxmox remote destination (with password auth)
-$ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass  conn_method=password restore_force
+$ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass  conn_method=password
 
 # Configure a Proxmox remote destination (with identity auth)
-$ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/something/pmx_id conn_method=identity restore_force
+$ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/something/pmx_id conn_method=identity
 
 # Restore backup to destination
 $ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
@@ -96,6 +97,8 @@ Backup (importer) commands:
 
 Restore (exporter) commands:
 - `cat > /var/lib/vz/dump/<archive>` (write archive to Proxmox storage)
-- `qmrestore /var/lib/vz/dump/<archive> <vmid> [--force]` (QEMU)
-- `pct restore <vmid> /var/lib/vz/dump/<archive> [--force]` (LXC)
+- `qm stop <vmid>` (QEMU)
+- `pct stop <vmid>` (LXC)
+- `qmrestore /var/lib/vz/dump/<archive> <vmid> --force` (QEMU)
+- `pct restore <vmid> /var/lib/vz/dump/<archive> --force` (LXC)
 - `rm -f -- /var/lib/vz/dump/<archive>` (when `cleanup=true`)
