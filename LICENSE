@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 Gilles DUBOIS
+ * Copyright (c) 2023 Gilles DUBOIS
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -13,16 +13,3 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
-package main
-
-import (
-	"os"
-
-	sdk "github.com/PlakarKorp/go-kloset-sdk"
-	"github.com/gillesdubois/plakar-integration-proxmox/importer"
-)
-
-func main() {
-	sdk.EntrypointImporter(os.Args, importer.NewProxmoxImporter)
-}
