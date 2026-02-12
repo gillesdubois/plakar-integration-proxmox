@@ -78,6 +78,11 @@ $ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remo
 
 # Restore backup to destination
 $ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
+
+# Restore one VM from a backup containing multiple dumps 
+plakar destination set myProxmoxHypervisorRemote vmid=101
+plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
+plakar destination unset myProxmoxHypervisorRemote vmid
 ``` 
 
 ## Proxmox tools / commands used
