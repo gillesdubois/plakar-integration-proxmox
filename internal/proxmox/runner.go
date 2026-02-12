@@ -126,7 +126,9 @@ func (r *SSHRunner) Run(ctx context.Context, name string, args ...string) (strin
 	if err != nil {
 		return "", "", err
 	}
-	defer session.Close()
+	defer func() {
+		_ = session.Close()
+	}()
 
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
@@ -150,7 +152,7 @@ func (r *SSHRunner) Open(ctx context.Context, filepath string) (io.ReadCloser, e
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		session.Close()
+		_ = session.Close()
 		return nil, err
 	}
 
@@ -159,7 +161,7 @@ func (r *SSHRunner) Open(ctx context.Context, filepath string) (io.ReadCloser, e
 
 	cmd := fmt.Sprintf("cat -- %s", shellQuote(filepath))
 	if err := session.Start(cmd); err != nil {
-		session.Close()
+		_ = session.Close()
 		return nil, err
 	}
 
@@ -178,7 +180,7 @@ func (r *SSHRunner) Create(ctx context.Context, filepath string) (io.WriteCloser
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		session.Close()
+		_ = session.Close()
 		return nil, err
 	}
 
@@ -188,7 +190,7 @@ func (r *SSHRunner) Create(ctx context.Context, filepath string) (io.WriteCloser
 	cmd := fmt.Sprintf("cat > %s", shellQuote(filepath))
 	if err := session.Start(cmd); err != nil {
 		_ = stdin.Close()
-		session.Close()
+		_ = session.Close()
 		return nil, err
 	}
 
