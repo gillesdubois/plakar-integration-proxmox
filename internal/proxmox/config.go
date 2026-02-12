@@ -46,6 +46,7 @@ type Config struct {
 	ConnUsername      string
 	ConnPassword      string
 	ConnIdentityFile  string
+	DumpDir           string
 	BackupCompression string
 	BackupMode        string
 	Node              string
@@ -84,6 +85,11 @@ func ParseConfig(config map[string]string) (*Config, error) {
 		Location: parsed,
 		Host:     host,
 		Mode:     mode,
+	}
+
+	cfg.DumpDir = strings.TrimSpace(config["dump_dir"])
+	if cfg.DumpDir == "" {
+		cfg.DumpDir = DefaultDumpDir
 	}
 
 	if cfg.Mode == ModeRemote {
