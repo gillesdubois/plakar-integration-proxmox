@@ -125,7 +125,7 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 				continue
 			}
 		}
-		dumpPath := path.Join(proxmox.DefaultDumpDir, base)
+		dumpPath := path.Join(p.cfg.DumpDir, base)
 
 		if err := p.writeDump(ctx, dumpPath, record.Reader); err != nil {
 			results <- record.Error(err)
