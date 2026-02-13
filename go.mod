@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/PlakarKorp/go-kloset-sdk v1.1.0-beta.1
 	github.com/PlakarKorp/kloset v1.1.0-beta.1.0.20260210141919-5c45a6595f9f
+	golang.org/x/crypto v0.47.0
 )
 
 require (
@@ -22,7 +23,6 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/mod v0.32.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
