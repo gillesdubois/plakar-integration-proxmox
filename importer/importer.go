@@ -17,8 +17,10 @@
 package importer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"path"
 	"strconv"
 	"strings"
@@ -43,8 +45,10 @@ type selection struct {
 	all  bool
 }
 
+const protocolName = "proxmox+backup"
+
 func init() {
-	if err := importer.Register("proxmox", 0, NewProxmoxImporter); err != nil {
+	if err := importer.Register(protocolName, 0, NewProxmoxImporter); err != nil {
 		panic(err)
 	}
 }
@@ -73,7 +77,7 @@ func NewProxmoxImporter(ctx context.Context, opts *connectors.Options, name stri
 }
 
 func (p *ProxmoxImporter) Origin() string        { return p.cfg.Origin() }
-func (p *ProxmoxImporter) Type() string          { return "proxmox" }
+func (p *ProxmoxImporter) Type() string          { return protocolName }
 func (p *ProxmoxImporter) Root() string          { return "/" }
 func (p *ProxmoxImporter) Flags() location.Flags { return location.FLAG_STREAM | location.FLAG_NEEDACK }
 
@@ -97,37 +101,30 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 			return err
 		}
 
-		archivePath, reader, sizePtr, err := p.client.BackupVMStream(ctx, vmid)
+		vmType, err := p.client.VMType(ctx, vmid)
 		if err != nil {
 			return err
 		}
 
+		backupRecord, err := p.buildBackupRecord(ctx, vmid)
+		if err != nil {
+			return err
+		}
+
+		archivePath := backupRecord.archivePath
 		archiveName := path.Base(archivePath)
-		if archiveName == "" {
-			return fmt.Errorf("empty archive name for vmid %d", vmid)
-		}
-		pathname := "/" + archiveName
-		modTime := time.Now()
-		fileInfo := objects.FileInfo{
-			Lname:    archiveName,
-			Lsize:    *sizePtr,
-			Lmode:    0600,
-			LmodTime: modTime,
-			Ldev:     1,
+		if isInvalidArchiveName(archiveName) {
+			_ = backupRecord.record.Close()
+			return fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
 		}
 
-		record := &connectors.Record{
-			Pathname: pathname,
-			Target:   "",
-			FileInfo: fileInfo,
-			Reader:   reader,
+		if err := p.emitRecord(ctx, records, results, backupRecord.record); err != nil {
+			return err
 		}
-		records <- record
 
-		if results != nil {
-			ack, ok := <-results
-			if ok && ack.Err != nil {
-				return ack.Err
+		if vmType == "qemu" || vmType == "lxc" {
+			if err := p.emitVMConfigRecord(ctx, records, results, vmType, vmid, archiveName); err != nil {
+				return err
 			}
 		}
 
@@ -156,6 +153,145 @@ func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
 	default:
 		return nil, fmt.Errorf("missing backup selection: vmid, pool or all")
 	}
+}
+
+type backupRecord struct {
+	archivePath string
+	record      *connectors.Record
+}
+
+func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmid int) (*backupRecord, error) {
+	if p.cfg.Mode == proxmox.ModeLocal {
+		archivePath, err := p.client.BackupVM(ctx, vmid)
+		if err != nil {
+			return nil, err
+		}
+
+		fileInfo, err := p.client.Stat(ctx, archivePath)
+		if err != nil {
+			return nil, err
+		}
+
+		reader, err := p.client.Open(ctx, archivePath)
+		if err != nil {
+			return nil, err
+		}
+
+		archiveName := path.Base(archivePath)
+		if isInvalidArchiveName(archiveName) {
+			return nil, fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
+		}
+
+		return &backupRecord{
+			archivePath: archivePath,
+			record: &connectors.Record{
+				Pathname: "/" + archiveName,
+				FileInfo: objects.FileInfo{
+					Lname:    archiveName,
+					Lsize:    fileInfo.Size(),
+					Lmode:    0600,
+					LmodTime: fileInfo.ModTime(),
+					Ldev:     1,
+				},
+				Reader: reader,
+			},
+		}, nil
+	}
+
+	archivePath, reader, sizePtr, err := p.client.BackupVMStream(ctx, vmid)
+	if err != nil {
+		return nil, err
+	}
+
+	size := int64(0)
+	if sizePtr != nil {
+		size = *sizePtr
+	}
+
+	archiveName := path.Base(archivePath)
+	if isInvalidArchiveName(archiveName) {
+		_ = reader.Close()
+		return nil, fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
+	}
+
+	return &backupRecord{
+		archivePath: archivePath,
+		record: &connectors.Record{
+			Pathname: "/" + archiveName,
+			FileInfo: objects.FileInfo{
+				Lname:    archiveName,
+				Lsize:    size,
+				Lmode:    0600,
+				LmodTime: time.Now(),
+				Ldev:     1,
+			},
+			Reader: reader,
+		},
+	}, nil
+}
+
+func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result, vmType string, vmid int, archiveName string) error {
+	var (
+		configData []byte
+		configName string
+		err        error
+	)
+
+	switch vmType {
+	case "qemu":
+		configData, err = p.client.ReadQEMUConfig(ctx, vmid)
+		configName = proxmox.BuildQEMUConfigSidecarFilename(archiveName)
+	case "lxc":
+		configData, err = p.client.ReadLXCConfig(ctx, vmid)
+		configName = proxmox.BuildLXCConfigSidecarFilename(archiveName)
+	default:
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	record := &connectors.Record{
+		Pathname: "/" + configName,
+		FileInfo: objects.FileInfo{
+			Lname:    configName,
+			Lsize:    int64(len(configData)),
+			Lmode:    0600,
+			LmodTime: time.Now(),
+			Ldev:     1,
+		},
+		Reader: io.NopCloser(bytes.NewReader(configData)),
+	}
+
+	return p.emitRecord(ctx, records, results, record)
+}
+
+func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result, record *connectors.Record) error {
+	select {
+	case <-ctx.Done():
+		_ = record.Close()
+		return ctx.Err()
+	case records <- record:
+	}
+
+	if results == nil {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case ack, ok := <-results:
+		if ok && ack.Err != nil {
+			return ack.Err
+		}
+	}
+
+	return nil
+}
+
+func isInvalidArchiveName(name string) bool {
+	return name == "" || name == "." || name == "/"
 }
 
 func parseSelection(config map[string]string) (selection, error) {
