@@ -46,6 +46,7 @@ type selection struct {
 }
 
 const protocolName = "proxmox+backup"
+const backupSnapshotRoot = "/backup"
 
 func init() {
 	if err := importer.Register(protocolName, 0, NewProxmoxImporter); err != nil {
@@ -106,7 +107,7 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 			return err
 		}
 
-		backupRecord, err := p.buildBackupRecord(ctx, vmid)
+		backupRecord, err := p.buildBackupRecord(ctx, vmType, vmid)
 		if err != nil {
 			return err
 		}
@@ -160,7 +161,7 @@ type backupRecord struct {
 	record      *connectors.Record
 }
 
-func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmid int) (*backupRecord, error) {
+func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, vmid int) (*backupRecord, error) {
 	if p.cfg.Mode == proxmox.ModeLocal {
 		archivePath, err := p.client.BackupVM(ctx, vmid)
 		if err != nil {
@@ -185,7 +186,7 @@ func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmid int) (*bac
 		return &backupRecord{
 			archivePath: archivePath,
 			record: &connectors.Record{
-				Pathname: "/" + archiveName,
+				Pathname: buildBackupSnapshotPath(vmType, vmid, archiveName),
 				FileInfo: objects.FileInfo{
 					Lname:    archiveName,
 					Lsize:    fileInfo.Size(),
@@ -217,7 +218,7 @@ func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmid int) (*bac
 	return &backupRecord{
 		archivePath: archivePath,
 		record: &connectors.Record{
-			Pathname: "/" + archiveName,
+			Pathname: buildBackupSnapshotPath(vmType, vmid, archiveName),
 			FileInfo: objects.FileInfo{
 				Lname:    archiveName,
 				Lsize:    size,
@@ -252,7 +253,7 @@ func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<-
 	}
 
 	record := &connectors.Record{
-		Pathname: "/" + configName,
+		Pathname: buildBackupSnapshotPath(vmType, vmid, configName),
 		FileInfo: objects.FileInfo{
 			Lname:    configName,
 			Lsize:    int64(len(configData)),
@@ -292,6 +293,10 @@ func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connec
 
 func isInvalidArchiveName(name string) bool {
 	return name == "" || name == "." || name == "/"
+}
+
+func buildBackupSnapshotPath(vmType string, vmid int, filename string) string {
+	return path.Join(backupSnapshotRoot, vmType, strconv.Itoa(vmid), filename)
 }
 
 func parseSelection(config map[string]string) (selection, error) {
