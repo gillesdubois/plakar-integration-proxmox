@@ -81,8 +81,8 @@ $ plakar destination add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mo
 # Restore backup to destination
 $ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
 
-# Restore one VM from a multi-VM snapshot by selecting a single dump
-$ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>:/vzdump-qemu-101-2026_02_10-02_00_00.vma.zst
+# Restore one VM from a multi-VM snapshot by selecting its backup directory
+$ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>:/backup/qemu/101
 ``` 
 
 ## Proxmox tools / commands used

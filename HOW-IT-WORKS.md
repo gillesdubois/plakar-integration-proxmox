@@ -49,10 +49,10 @@
    - in `mode=local`: run `vzdump` to generate a dump file in `dump_dir`, then read that file.
    - in `mode=remote`: run `vzdump --stdout`.
 6. In remote mode, detect compression by reading the first bytes (gzip, zstd, lzo signatures) to generate a proper filename.
-7. Send the dump to Plakar as `vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]`.
+7. Send the dump to Plakar under `/backup/<type>/<vmid>/` using filename `vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]`.
 8. For QEMU and LXC, also export VM config files as sidecars:
-   - QEMU: `/etc/pve/qemu-server/<vmid>.conf` as `<dump>_qemu.conf`
-   - LXC: `/etc/pve/lxc/<vmid>.conf` as `<dump>_lxc.conf`
+   - QEMU: `/etc/pve/qemu-server/<vmid>.conf` as `/backup/qemu/<vmid>/<dump>_qemu.conf`
+   - LXC: `/etc/pve/lxc/<vmid>.conf` as `/backup/lxc/<vmid>/<dump>_lxc.conf`
 9. `cleanup` option: if a dump was written to disk (local mode), it is removed.
 
 ## Restore Flow (Exporter)
@@ -75,19 +75,19 @@
 
 ## Snapshot File Structure
 
-Each backed-up VM/CT produces a dump object at the snapshot root:
-- `/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]`
+Each backed-up VM/CT produces a dump object under `/backup/<type>/<vmid>/`:
+- `/backup/<type>/<vmid>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]`
 
 For VM configs, sidecar files are also added:
-- `/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_qemu.conf`
-- `/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_lxc.conf`
+- `/backup/<type>/<vmid>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_qemu.conf`
+- `/backup/<type>/<vmid>/vzdump-<type>-<vmid>-<timestamp>.<ext>[.gz|.zst|.lzo]_lxc.conf`
 
 ## Snapshot Example
 
 Example for a QEMU VM with `vmid=101` compressed with zstd:
 
 ```text
-/vzdump-qemu-101-2026_02_10-02_00_00.vma.zst
+/backup/qemu/101/vzdump-qemu-101-2026_02_10-02_00_00.vma.zst
 ```
 
 ## Why We Use Canonical Proxmox Names
