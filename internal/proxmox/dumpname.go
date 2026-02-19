@@ -94,6 +94,28 @@ func IsConfigSidecarFilename(name string) bool {
 	return IsQEMUConfigSidecarFilename(name) || IsLXCConfigSidecarFilename(name)
 }
 
+func ParseConfigSidecarFilename(name string) (string, string, error) {
+	base := filepath.Base(name)
+	lower := strings.ToLower(base)
+
+	switch {
+	case strings.HasSuffix(lower, QEMUConfigSidecarSuffix):
+		dumpName := base[:len(base)-len(QEMUConfigSidecarSuffix)]
+		if dumpName == "" {
+			return "", "", fmt.Errorf("invalid qemu config sidecar filename: %s", base)
+		}
+		return dumpName, "qemu", nil
+	case strings.HasSuffix(lower, LXCConfigSidecarSuffix):
+		dumpName := base[:len(base)-len(LXCConfigSidecarSuffix)]
+		if dumpName == "" {
+			return "", "", fmt.Errorf("invalid lxc config sidecar filename: %s", base)
+		}
+		return dumpName, "lxc", nil
+	default:
+		return "", "", fmt.Errorf("invalid config sidecar filename: %s", base)
+	}
+}
+
 func canonicalArchiveSuffix(originalName, vmType string) string {
 	baseExt := ".vma"
 	if vmType == "lxc" {
