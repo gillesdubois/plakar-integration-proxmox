@@ -55,6 +55,10 @@ type vmRuntimeState struct {
 	running bool
 }
 
+type restoreOptions struct {
+	storage string
+}
+
 const protocolName = "proxmox+backup"
 
 func init() {
@@ -221,22 +225,21 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 	}
 
 	shouldStartAfterRestore := false
+	opts := restoreOptions{}
+
 	if state.exists {
 		shouldStartAfterRestore = state.running
 		if err := p.stopVM(ctx, vmType, vmid); err != nil {
 			return err
 		}
 	} else {
-		if len(configData) == 0 {
-			return fmt.Errorf("%s %d does not exist and no config sidecar was provided", vmType, vmid)
-		}
-		if err := p.writeVMConfig(ctx, vmType, vmid, configData); err != nil {
-			return err
+		if storage := parseStorageFromConfig(vmType, configData); storage != "" {
+			opts.storage = storage
 		}
 		shouldStartAfterRestore = true
 	}
 
-	restoreErr := p.runRestoreDump(ctx, dumpPath, vmType, vmid)
+	restoreErr := p.runRestoreDump(ctx, dumpPath, vmType, vmid, opts)
 	if restoreErr != nil {
 		if state.exists && state.running {
 			if startErr := p.startVM(ctx, vmType, vmid); startErr != nil {
@@ -255,7 +258,7 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 	return nil
 }
 
-func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType string, vmid int) error {
+func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType string, vmid int, opts restoreOptions) error {
 	vmidStr := strconv.Itoa(vmid)
 	var cmd string
 	var args []string
@@ -268,6 +271,9 @@ func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType s
 		args = []string{"restore", vmidStr, dumpPath, "--force"}
 	default:
 		return fmt.Errorf("unsupported backup type: %s", vmType)
+	}
+	if opts.storage != "" {
+		args = append(args, "--storage", opts.storage)
 	}
 
 	_, stderr, err := p.client.Run(ctx, cmd, args...)
@@ -303,24 +309,6 @@ func (p *ProxmoxExporter) vmState(ctx context.Context, vmType string, vmid int) 
 	default:
 		return vmRuntimeState{}, fmt.Errorf("unable to parse status for %s %d: %s", vmType, vmid, preferredOutput(stdout, stderr))
 	}
-}
-
-func (p *ProxmoxExporter) writeVMConfig(ctx context.Context, vmType string, vmid int, configData []byte) error {
-	configPath, err := proxmox.VMConfigPath(vmType, vmid)
-	if err != nil {
-		return err
-	}
-
-	writer, err := p.client.Create(ctx, configPath)
-	if err != nil {
-		return err
-	}
-
-	if _, err := writer.Write(configData); err != nil {
-		_ = writer.Close()
-		return err
-	}
-	return writer.Close()
 }
 
 func (p *ProxmoxExporter) stopVM(ctx context.Context, vmType string, vmid int) error {
@@ -411,6 +399,81 @@ func parseStatusValue(output string) string {
 		}
 	}
 	return ""
+}
+
+func parseStorageFromConfig(vmType string, configData []byte) string {
+	if len(configData) == 0 {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(configData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.ToLower(key))
+		value = strings.TrimSpace(value)
+
+		switch vmType {
+		case "lxc":
+			if key == "rootfs" {
+				if storage := parseStorageFromVolumeSpec(value); storage != "" {
+					return storage
+				}
+			}
+		case "qemu":
+			if !isQEMUDiskConfigKey(key) {
+				continue
+			}
+			if storage := parseStorageFromVolumeSpec(value); storage != "" {
+				return storage
+			}
+		}
+	}
+
+	return ""
+}
+
+func parseStorageFromVolumeSpec(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return ""
+	}
+
+	volume := strings.Split(spec, ",")[0]
+	volume = strings.TrimSpace(volume)
+	if volume == "" {
+		return ""
+	}
+
+	storage, _, ok := strings.Cut(volume, ":")
+	if !ok {
+		return ""
+	}
+	storage = strings.TrimSpace(storage)
+	if storage == "" {
+		return ""
+	}
+
+	// Ignore explicit "none" values used in some optional disk entries.
+	if strings.EqualFold(storage, "none") {
+		return ""
+	}
+	return storage
+}
+
+func isQEMUDiskConfigKey(key string) bool {
+	return strings.HasPrefix(key, "scsi") ||
+		strings.HasPrefix(key, "virtio") ||
+		strings.HasPrefix(key, "sata") ||
+		strings.HasPrefix(key, "ide") ||
+		strings.HasPrefix(key, "efidisk") ||
+		strings.HasPrefix(key, "tpmstate")
 }
 
 func readRecordBytes(record *connectors.Record) ([]byte, error) {
