@@ -28,6 +28,9 @@ import (
 	"time"
 )
 
+const qemuConfigDir = "/etc/pve/qemu-server"
+const lxcConfigDir = "/etc/pve/lxc"
+
 func (c *Client) BackupVM(ctx context.Context, vmid int) (string, error) {
 	args := []string{strconv.Itoa(vmid), "--dumpdir", c.cfg.DumpDir, "--mode", c.cfg.BackupMode, "--compress", c.cfg.BackupCompression}
 	if c.cfg.Node != "" {
@@ -115,6 +118,31 @@ func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadC
 	}
 
 	return archivePath, reader, &size, nil
+}
+
+func (c *Client) ReadQEMUConfig(ctx context.Context, vmid int) ([]byte, error) {
+	return c.readVMConfig(ctx, qemuConfigDir, "qemu", vmid)
+}
+
+func (c *Client) ReadLXCConfig(ctx context.Context, vmid int) ([]byte, error) {
+	return c.readVMConfig(ctx, lxcConfigDir, "lxc", vmid)
+}
+
+func (c *Client) readVMConfig(ctx context.Context, configDir, vmType string, vmid int) ([]byte, error) {
+	configPath := path.Join(configDir, fmt.Sprintf("%d.conf", vmid))
+
+	reader, err := c.Open(ctx, configPath)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read %s config %s: %w", vmType, configPath, err)
+	}
+	defer reader.Close()
+
+	configData, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read %s config content %s: %w", vmType, configPath, err)
+	}
+
+	return configData, nil
 }
 
 var archiveRegex = regexp.MustCompile(`(?m)creating (?:vzdump )?archive ['"]([^'"]+)['"]`)
