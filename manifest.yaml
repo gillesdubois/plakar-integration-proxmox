@@ -10,9 +10,9 @@ connectors:
   executable: proxmoxImporter
   homepage: https://github.com/gillesdubois/plakar-integration-proxmox
   license: ISC
-  protocols: [proxmox]
+  protocols: [proxmox+backup]
 - type: exporter
   executable: proxmoxExporter
   homepage: https://github.com/gillesdubois/plakar-integration-proxmox
   license: ISC
-  protocols: [proxmox]
+  protocols: [proxmox+backup]
