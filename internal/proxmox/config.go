@@ -135,7 +135,7 @@ func ParseConfig(config map[string]string) (*Config, error) {
 
 	cfg.Node = strings.TrimSpace(config["node"])
 
-	cleanup, err := parseBool(config, "cleanup", false)
+	cleanup, err := parseBool(config, "cleanup", true)
 	if err != nil {
 		return nil, err
 	}
