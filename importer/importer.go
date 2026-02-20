@@ -127,6 +127,9 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 			if err := p.emitVMConfigRecord(ctx, records, vmType, vmid, archiveName); err != nil {
 				return err
 			}
+			if err := p.emitVMPoolRecord(ctx, records, vmType, vmid, archiveName); err != nil {
+				return err
+			}
 		}
 
 		if p.cfg.Cleanup && archivePath != "" && path.IsAbs(archivePath) {
@@ -262,6 +265,34 @@ func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<-
 			Ldev:     1,
 		},
 		Reader: io.NopCloser(bytes.NewReader(configData)),
+	}
+
+	return p.emitRecord(ctx, records, record)
+}
+
+func (p *ProxmoxImporter) emitVMPoolRecord(ctx context.Context, records chan<- *connectors.Record, vmType string, vmid int, archiveName string) error {
+	poolName, err := p.client.VMPool(ctx, vmid)
+	if err != nil {
+		return err
+	}
+	poolName = strings.TrimSpace(poolName)
+	if poolName == "" {
+		return nil
+	}
+
+	poolSidecarName := proxmox.BuildPoolSidecarFilename(archiveName)
+	poolData := []byte(poolName)
+
+	record := &connectors.Record{
+		Pathname: buildBackupSnapshotPath(vmType, vmid, poolSidecarName),
+		FileInfo: objects.FileInfo{
+			Lname:    poolSidecarName,
+			Lsize:    int64(len(poolData)),
+			Lmode:    0600,
+			LmodTime: time.Now(),
+			Ldev:     1,
+		},
+		Reader: io.NopCloser(bytes.NewReader(poolData)),
 	}
 
 	return p.emitRecord(ctx, records, record)
