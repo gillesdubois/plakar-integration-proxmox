@@ -80,13 +80,13 @@ func NewProxmoxImporter(ctx context.Context, opts *connectors.Options, name stri
 func (p *ProxmoxImporter) Origin() string        { return p.cfg.Origin() }
 func (p *ProxmoxImporter) Type() string          { return protocolName }
 func (p *ProxmoxImporter) Root() string          { return "/" }
-func (p *ProxmoxImporter) Flags() location.Flags { return location.FLAG_STREAM | location.FLAG_NEEDACK }
+func (p *ProxmoxImporter) Flags() location.Flags { return location.FLAG_STREAM }
 
 func (p *ProxmoxImporter) Ping(ctx context.Context) error {
 	return p.client.Ping(ctx)
 }
 
-func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result) error {
+func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors.Record, _ <-chan *connectors.Result) error {
 	defer close(records)
 
 	vmids, err := p.resolveVMIDs(ctx)
@@ -119,12 +119,12 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 			return fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
 		}
 
-		if err := p.emitRecord(ctx, records, results, backupRecord.record); err != nil {
+		if err := p.emitRecord(ctx, records, backupRecord.record); err != nil {
 			return err
 		}
 
 		if vmType == "qemu" || vmType == "lxc" {
-			if err := p.emitVMConfigRecord(ctx, records, results, vmType, vmid, archiveName); err != nil {
+			if err := p.emitVMConfigRecord(ctx, records, vmType, vmid, archiveName); err != nil {
 				return err
 			}
 		}
@@ -231,7 +231,7 @@ func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, 
 	}, nil
 }
 
-func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result, vmType string, vmid int, archiveName string) error {
+func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<- *connectors.Record, vmType string, vmid int, archiveName string) error {
 	var (
 		configData []byte
 		configName string
@@ -264,30 +264,16 @@ func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<-
 		Reader: io.NopCloser(bytes.NewReader(configData)),
 	}
 
-	return p.emitRecord(ctx, records, results, record)
+	return p.emitRecord(ctx, records, record)
 }
 
-func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connectors.Record, results <-chan *connectors.Result, record *connectors.Record) error {
+func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connectors.Record, record *connectors.Record) error {
 	select {
 	case <-ctx.Done():
 		_ = record.Close()
 		return ctx.Err()
 	case records <- record:
 	}
-
-	if results == nil {
-		return nil
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case ack, ok := <-results:
-		if ok && ack.Err != nil {
-			return ack.Err
-		}
-	}
-
 	return nil
 }
 
