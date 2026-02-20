@@ -28,6 +28,7 @@ import (
 const DumpFilenameVersion = 1
 const QEMUConfigSidecarSuffix = "_qemu.conf"
 const LXCConfigSidecarSuffix = "_lxc.conf"
+const PoolSidecarSuffix = "_pool.conf"
 
 var dumpNameRegex = regexp.MustCompile(`^vzdump(?:-v(\d+))?-(qemu|lxc)-(\d+)-`)
 
@@ -82,6 +83,10 @@ func BuildLXCConfigSidecarFilename(archiveName string) string {
 	return archiveName + LXCConfigSidecarSuffix
 }
 
+func BuildPoolSidecarFilename(archiveName string) string {
+	return archiveName + PoolSidecarSuffix
+}
+
 func IsQEMUConfigSidecarFilename(name string) bool {
 	return strings.HasSuffix(strings.ToLower(filepath.Base(name)), QEMUConfigSidecarSuffix)
 }
@@ -92,6 +97,10 @@ func IsLXCConfigSidecarFilename(name string) bool {
 
 func IsConfigSidecarFilename(name string) bool {
 	return IsQEMUConfigSidecarFilename(name) || IsLXCConfigSidecarFilename(name)
+}
+
+func IsPoolSidecarFilename(name string) bool {
+	return strings.HasSuffix(strings.ToLower(filepath.Base(name)), PoolSidecarSuffix)
 }
 
 func ParseConfigSidecarFilename(name string) (string, string, error) {
@@ -114,6 +123,20 @@ func ParseConfigSidecarFilename(name string) (string, string, error) {
 	default:
 		return "", "", fmt.Errorf("invalid config sidecar filename: %s", base)
 	}
+}
+
+func ParsePoolSidecarFilename(name string) (string, error) {
+	base := filepath.Base(name)
+	lower := strings.ToLower(base)
+	if !strings.HasSuffix(lower, PoolSidecarSuffix) {
+		return "", fmt.Errorf("invalid pool sidecar filename: %s", base)
+	}
+
+	dumpName := base[:len(base)-len(PoolSidecarSuffix)]
+	if dumpName == "" {
+		return "", fmt.Errorf("invalid pool sidecar filename: %s", base)
+	}
+	return dumpName, nil
 }
 
 func canonicalArchiveSuffix(originalName, vmType string) string {
