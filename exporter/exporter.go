@@ -57,6 +57,7 @@ type vmRuntimeState struct {
 
 type restoreOptions struct {
 	storage string
+	pool    string
 }
 
 const protocolName = "proxmox+backup"
@@ -94,6 +95,7 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 	defer close(results)
 
 	sidecars := make(map[string]vmConfigSidecar)
+	poolSidecars := make(map[string]string)
 	pendingRestores := make([]pendingRestore, 0)
 
 	for record := range records {
@@ -110,6 +112,15 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 		base := path.Base(record.Pathname)
 		if proxmox.IsConfigSidecarFilename(base) {
 			if err := p.collectConfigSidecar(record, base, sidecars); err != nil {
+				_ = closeRecord(record)
+				results <- resultFromRecord(record, err)
+				continue
+			}
+			results <- resultFromRecord(record, nil)
+			continue
+		}
+		if proxmox.IsPoolSidecarFilename(base) {
+			if err := p.collectPoolSidecar(record, base, poolSidecars); err != nil {
 				_ = closeRecord(record)
 				results <- resultFromRecord(record, err)
 				continue
@@ -157,7 +168,12 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 
 		configData, err := p.resolveConfigForDump(pending, sidecars)
 		if err == nil {
-			err = p.restoreDump(ctx, pending.dumpPath, pending.vmType, pending.vmid, configData)
+			poolName, poolErr := p.resolvePoolForDump(pending, poolSidecars)
+			if poolErr != nil {
+				err = poolErr
+			} else {
+				err = p.restoreDump(ctx, pending.dumpPath, pending.vmType, pending.vmid, configData, poolName)
+			}
 		}
 
 		if err == nil && p.cfg.Cleanup {
@@ -218,7 +234,29 @@ func (p *ProxmoxExporter) resolveConfigForDump(pending pendingRestore, sidecars 
 	return sidecar.data, nil
 }
 
-func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int, configData []byte) error {
+func (p *ProxmoxExporter) collectPoolSidecar(record *connectors.Record, sidecarBase string, sidecars map[string]string) error {
+	dumpBase, err := proxmox.ParsePoolSidecarFilename(sidecarBase)
+	if err != nil {
+		return err
+	}
+
+	poolData, err := readRecordBytes(record)
+	if err != nil {
+		return err
+	}
+	sidecars[dumpBase] = strings.TrimSpace(string(poolData))
+	return nil
+}
+
+func (p *ProxmoxExporter) resolvePoolForDump(pending pendingRestore, sidecars map[string]string) (string, error) {
+	poolName, ok := sidecars[pending.dumpBase]
+	if !ok {
+		return "", nil
+	}
+	return strings.TrimSpace(poolName), nil
+}
+
+func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int, configData []byte, poolName string) error {
 	state, err := p.vmState(ctx, vmType, vmid)
 	if err != nil {
 		return err
@@ -235,6 +273,15 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 	} else {
 		if storage := parseStorageFromConfig(vmType, configData); storage != "" {
 			opts.storage = storage
+		}
+		if poolName != "" {
+			exists, err := p.client.PoolExists(ctx, poolName)
+			if err != nil {
+				return err
+			}
+			if exists {
+				opts.pool = poolName
+			}
 		}
 		shouldStartAfterRestore = true
 	}
@@ -274,6 +321,9 @@ func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType s
 	}
 	if opts.storage != "" {
 		args = append(args, "--storage", opts.storage)
+	}
+	if opts.pool != "" {
+		args = append(args, "--pool", opts.pool)
 	}
 
 	_, stderr, err := p.client.Run(ctx, cmd, args...)
