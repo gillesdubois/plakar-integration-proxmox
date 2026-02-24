@@ -262,15 +262,13 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 		return err
 	}
 
-	shouldStartAfterRestore := false
+	if state.exists && state.running {
+		return fmt.Errorf("refusing restore for %s %d: VM/CT is running (stop it first)", vmType, vmid)
+	}
+
 	opts := restoreOptions{}
 
-	if state.exists {
-		shouldStartAfterRestore = state.running
-		if err := p.stopVM(ctx, vmType, vmid); err != nil {
-			return err
-		}
-	} else {
+	if !state.exists {
 		if storage := parseStorageFromConfig(vmType, configData); storage != "" {
 			opts.storage = storage
 		}
@@ -283,20 +281,13 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 				opts.pool = poolName
 			}
 		}
-		shouldStartAfterRestore = true
 	}
 
-	restoreErr := p.runRestoreDump(ctx, dumpPath, vmType, vmid, opts)
-	if restoreErr != nil {
-		if state.exists && state.running {
-			if startErr := p.startVM(ctx, vmType, vmid); startErr != nil {
-				return errors.Join(restoreErr, fmt.Errorf("failed to restore previous running state: %w", startErr))
-			}
-		}
-		return restoreErr
+	if err := p.runRestoreDump(ctx, dumpPath, vmType, vmid, opts); err != nil {
+		return err
 	}
 
-	if shouldStartAfterRestore {
+	if p.cfg.StartOnRestore {
 		if err := p.startVM(ctx, vmType, vmid); err != nil {
 			return err
 		}
@@ -361,25 +352,6 @@ func (p *ProxmoxExporter) vmState(ctx context.Context, vmType string, vmid int) 
 	}
 }
 
-func (p *ProxmoxExporter) stopVM(ctx context.Context, vmType string, vmid int) error {
-	cmd, err := vmCommand(vmType)
-	if err != nil {
-		return err
-	}
-
-	vmidStr := strconv.Itoa(vmid)
-	stdout, stderr, err := p.client.Run(ctx, cmd, "stop", vmidStr)
-	if err != nil {
-		output := preferredOutput(stdout, stderr)
-		if isIgnorableStopError(output) {
-			return nil
-		}
-		return fmt.Errorf("stop failed for %s %d: %w: %s", vmType, vmid, err, output)
-	}
-
-	return nil
-}
-
 func (p *ProxmoxExporter) startVM(ctx context.Context, vmType string, vmid int) error {
 	cmd, err := vmCommand(vmType)
 	if err != nil {
@@ -408,13 +380,6 @@ func vmCommand(vmType string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported backup type: %s", vmType)
 	}
-}
-
-func isIgnorableStopError(output string) bool {
-	normalized := strings.ToLower(output)
-	return isMissingVMError(normalized) ||
-		strings.Contains(normalized, "not running") ||
-		strings.Contains(normalized, "already stopped")
 }
 
 func isIgnorableStartError(output string) bool {
