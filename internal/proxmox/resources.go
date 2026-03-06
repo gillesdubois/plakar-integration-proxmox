@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,8 @@ type vmResource struct {
 	VMID int    `json:"vmid"`
 	Type string `json:"type"`
 	Node string `json:"node"`
+	Name string `json:"name,omitempty"`
+	Pool string `json:"pool,omitempty"`
 }
 
 type poolResponse struct {
@@ -45,24 +48,53 @@ func (c *Client) ListAllVMIDs(ctx context.Context) ([]int, error) {
 }
 
 func (c *Client) VMType(ctx context.Context, vmid int) (string, error) {
-	resources, err := c.listResources(ctx)
+	res, err := c.vmResourceByID(ctx, vmid)
 	if err != nil {
 		return "", err
 	}
+	return res.Type, nil
+}
 
-	for _, res := range resources {
-		if res.VMID != vmid {
-			continue
-		}
-		if c.cfg.Node != "" && res.Node != c.cfg.Node {
-			continue
-		}
-		if res.Type == "qemu" || res.Type == "lxc" {
-			return res.Type, nil
-		}
+func (c *Client) VMPool(ctx context.Context, vmid int) (string, error) {
+	res, err := c.vmResourceByID(ctx, vmid)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Pool), nil
+}
+
+func (c *Client) VMName(ctx context.Context, vmid int) (string, error) {
+	res, err := c.vmResourceByID(ctx, vmid)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Name), nil
+}
+
+func (c *Client) PoolExists(ctx context.Context, pool string) (bool, error) {
+	pool = strings.TrimSpace(pool)
+	if pool == "" {
+		return false, nil
 	}
 
-	return "", fmt.Errorf("unable to determine VM type for vmid %d", vmid)
+	_, err := c.runPvesh(ctx, "pvesh get pool failed", "get", "/pools/"+pool, "--output-format", "json")
+	if err != nil {
+		if isMissingPoolError(err.Error()) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func isMissingPoolError(output string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(output))
+	if normalized == "" {
+		return false
+	}
+	return strings.Contains(normalized, "does not exist") ||
+		strings.Contains(normalized, "not found") ||
+		strings.Contains(normalized, "no such")
 }
 
 func (c *Client) ListPoolVMIDs(ctx context.Context, pool string) ([]int, error) {
@@ -96,6 +128,27 @@ func filterVMIDs(resources []vmResource, node string) []int {
 	}
 	sort.Ints(vmids)
 	return vmids
+}
+
+func (c *Client) vmResourceByID(ctx context.Context, vmid int) (vmResource, error) {
+	resources, err := c.listResources(ctx)
+	if err != nil {
+		return vmResource{}, err
+	}
+
+	for _, res := range resources {
+		if res.VMID != vmid {
+			continue
+		}
+		if c.cfg.Node != "" && res.Node != c.cfg.Node {
+			continue
+		}
+		if res.Type == "qemu" || res.Type == "lxc" {
+			return res, nil
+		}
+	}
+
+	return vmResource{}, fmt.Errorf("unable to determine VM resource for vmid %d", vmid)
 }
 
 func (c *Client) listResources(ctx context.Context) ([]vmResource, error) {

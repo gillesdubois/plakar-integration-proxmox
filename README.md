@@ -34,11 +34,19 @@ The configuration parameters are as follows:
     - `snapshot` : Use a snapshot mode without stopping or suspending VM / CT
     - `suspend` : VM or CT will be suspended during the backup
     - `stop` : Proxmox will stop the VM / CT in order to perform the backup
-- `dump_dir` (optional): Directory used by Proxmox to store dump archives for restore uploads (defaults to `/var/lib/vz/dump`). Backup streams do not write dump files to this directory.
+- `dump_dir` (optional): Directory used by Proxmox to store dump archives (defaults to `/var/lib/vz/dump`). It is used for restore uploads and for backup generation in both modes.
 - `node` (optional): Proxmox node to target for restore/upload operations (required if your cluster has multiple nodes)
-- `cleanup` (optional): When `true`, delete the vzdump file from Proxmox storage after restore (defaults to `false`). Backup streams do not create a dump file to remove.
+- `cleanup` (optional): When `true`, delete temporary vzdump files from Proxmox storage after restore and after backups (defaults to `true`).
+- `start_on_restore` (optional): When `true`, start the restored VM/CT after a successful restore (defaults to `false`).
 
-Restores always stop the target VM/CT first and use force-restore to overwrite an existing VM/CT with the same ID.
+## Restore Behavior
+
+During restore, the exporter checks whether the target VM/CT exists and its runtime state:
+
+- **If it exists and is running**: restore is refused (the VM/CT must be stopped first).
+- **If it exists and is stopped**: restore is performed in place.
+- **If it does not exist**: restore is performed from the dump. When a matching sidecar config file (`_qemu.conf` or `_lxc.conf`) is available, it may be used as a storage hint for restore. When a matching pool sidecar (`_pool.conf`) is available, the exporter checks that the pool still exists and then passes `--pool <pool>`.
+- **After a successful restore**: the VM/CT is started only when `start_on_restore=true`.
 
 ## Backup selection options
 
@@ -53,34 +61,37 @@ You should set exactly one of the following:
 
 ```bash
 # Configure a Proxmox local source
-$ plakar source add myProxmoxHypervisorLocal proxmox://10.0.0.10 mode=local
+$ plakar source add myProxmoxHypervisorLocal proxmox+backup://10.0.0.10 mode=local
 
 # Configure a Proxmox remote source (with password auth)
-$ plakar source add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass conn_method=password
+$ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass conn_method=password
 
 # Configure a Proxmox remote source (with identity auth)
-$ plakar source add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/somewhere/pmx_id conn_method=identity
+$ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/somewhere/pmx_id conn_method=identity
 
 # Backup VM / CT
 $ plakar at /tmp/example backup -o vmid=101 @myProxmoxHypervisorSrc
 $ plakar at /tmp/example backup -o pool=prod @myProxmoxHypervisorSrc
 $ plakar at /tmp/example backup -o all @myProxmoxHypervisorSrc 
-$ plakar at /tmp/example backup -o vmid=101 -o cleanup=true @myProxmoxHypervisorSrc 
+$ plakar at /tmp/example backup -o vmid=101 -o cleanup=false @myProxmoxHypervisorSrc 
 
 # Configure a Proxmox local destination
-$ plakar destination add myProxmoxHypervisorLocal proxmox://10.0.0.10 mode=local
+$ plakar destination add myProxmoxHypervisorLocal proxmox+backup://10.0.0.10 mode=local
 
 # Configure a Proxmox remote destination (with password auth)
-$ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass  conn_method=password
+$ plakar destination add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_password=aSecureAndStrongPass  conn_method=password
 
 # Configure a Proxmox remote destination (with identity auth)
-$ plakar destination add myProxmoxHypervisorRemote proxmox://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/something/pmx_id conn_method=identity
+$ plakar destination add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/something/pmx_id conn_method=identity
+
+# Configure a Proxmox destination and start VM/CT automatically after restore
+$ plakar destination add myProxmoxHypervisorRemoteAutoStart proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/something/pmx_id conn_method=identity start_on_restore=true
 
 # Restore backup to destination
 $ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
 
-# Restore one VM from a multi-VM snapshot by selecting a single dump
-$ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>:/vzdump-qemu-101-2026_02_10-02_00_00.vma.zst
+# Restore one VM from a multi-VM snapshot by selecting its backup directory
+$ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>:/backup/qemu/101_myvm
 ``` 
 
 ## Proxmox tools / commands used
@@ -93,14 +104,17 @@ Backup (importer) commands:
 - `pvesh get /version --output-format json`
 - `pvesh get /cluster/resources --type vm --output-format json` (when `all`)
 - `pvesh get /pools/<pool> --output-format json` (when `pool=...`)
-- `vzdump <vmid> --stdout --mode <snapshot|suspend|stop> --compress <0|1|lzo|gzip|zstd> [--node <node>]` (stream archive to Plakar)
+- `vzdump <vmid> --dumpdir <dump_dir> --mode <snapshot|suspend|stop> --compress <0|1|lzo|gzip|zstd> [--node <node>]` (when `mode=local` and `mode=remote`)
+- `cat -- /etc/pve/qemu-server/<vmid>.conf` (for QEMU sidecar config file)
+- `cat -- /etc/pve/lxc/<vmid>.conf` (for LXC sidecar config file)
 
 Restore (exporter) commands:
 - `cat > <dump_dir>/<archive>` (write archive to Proxmox storage)
-- `qm stop <vmid>` (QEMU)
-- `pct stop <vmid>` (LXC)
-- `qmrestore <dump_dir>/<archive> <vmid> --force` (QEMU)
-- `pct restore <vmid> <dump_dir>/<archive> --force` (LXC)
+- `qm status <vmid>` / `pct status <vmid>` (check existence and running state)
+- `pvesh get /pools/<pool> --output-format json` (only when a `_pool.conf` sidecar is present)
+- `qmrestore <dump_dir>/<archive> <vmid> --force [--storage <storage>] [--pool <pool>]` (QEMU)
+- `pct restore <vmid> <dump_dir>/<archive> --force [--storage <storage>] [--pool <pool>]` (LXC)
+- `qm start <vmid>` / `pct start <vmid>` (only when `start_on_restore=true`)
 - `rm -f -- <dump_dir>/<archive>` (when `cleanup=true`)
 
 ## Technical / code overview 

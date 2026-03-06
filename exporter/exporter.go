@@ -18,6 +18,7 @@ package exporter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -36,8 +37,33 @@ type ProxmoxExporter struct {
 	client *proxmox.Client
 }
 
+type vmConfigSidecar struct {
+	vmType string
+	data   []byte
+}
+
+type pendingRestore struct {
+	record   *connectors.Record
+	vmType   string
+	vmid     int
+	dumpBase string
+	dumpPath string
+}
+
+type vmRuntimeState struct {
+	exists  bool
+	running bool
+}
+
+type restoreOptions struct {
+	storage string
+	pool    string
+}
+
+const protocolName = "proxmox+backup"
+
 func init() {
-	if err := exporter.Register("proxmox", 0, NewProxmoxExporter); err != nil {
+	if err := exporter.Register(protocolName, 0, NewProxmoxExporter); err != nil {
 		panic(err)
 	}
 }
@@ -57,7 +83,7 @@ func NewProxmoxExporter(ctx context.Context, opts *connectors.Options, name stri
 }
 
 func (p *ProxmoxExporter) Origin() string        { return p.cfg.Origin() }
-func (p *ProxmoxExporter) Type() string          { return "proxmox" }
+func (p *ProxmoxExporter) Type() string          { return protocolName }
 func (p *ProxmoxExporter) Root() string          { return "/" }
 func (p *ProxmoxExporter) Flags() location.Flags { return 0 }
 
@@ -68,13 +94,41 @@ func (p *ProxmoxExporter) Ping(ctx context.Context) error {
 func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors.Record, results chan<- *connectors.Result) error {
 	defer close(results)
 
+	sidecars := make(map[string]vmConfigSidecar)
+	poolSidecars := make(map[string]string)
+	pendingRestores := make([]pendingRestore, 0)
+
 	for record := range records {
+		if err := ctx.Err(); err != nil {
+			results <- record.Error(err)
+			continue
+		}
+
 		if record.Err != nil || record.IsXattr || !record.FileInfo.Lmode.IsRegular() {
 			results <- record.Ok()
 			continue
 		}
 
 		base := path.Base(record.Pathname)
+		if proxmox.IsConfigSidecarFilename(base) {
+			if err := p.collectConfigSidecar(record, base, sidecars); err != nil {
+				_ = closeRecord(record)
+				results <- resultFromRecord(record, err)
+				continue
+			}
+			results <- resultFromRecord(record, nil)
+			continue
+		}
+		if proxmox.IsPoolSidecarFilename(base) {
+			if err := p.collectPoolSidecar(record, base, poolSidecars); err != nil {
+				_ = closeRecord(record)
+				results <- resultFromRecord(record, err)
+				continue
+			}
+			results <- resultFromRecord(record, nil)
+			continue
+		}
+
 		vmType, vmid, err := proxmox.ParseDumpFilename(base)
 		if err != nil {
 			if strings.HasPrefix(base, "vzdump-") {
@@ -84,9 +138,9 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			results <- record.Ok()
 			continue
 		}
+
 		dumpName := proxmox.BuildRestoreDumpFilename(base, vmType, vmid, time.Now())
 		dumpPath := path.Join(p.cfg.DumpDir, dumpName)
-
 		if err := p.writeDump(ctx, dumpPath, record.Reader); err != nil {
 			results <- record.Error(err)
 			continue
@@ -97,19 +151,38 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			continue
 		}
 
-		if err := p.restoreDump(ctx, dumpPath, vmType, vmid); err != nil {
-			results <- resultFromRecord(record, err)
+		pendingRestores = append(pendingRestores, pendingRestore{
+			record:   record,
+			vmType:   vmType,
+			vmid:     vmid,
+			dumpBase: base,
+			dumpPath: dumpPath,
+		})
+	}
+
+	for _, pending := range pendingRestores {
+		if err := ctx.Err(); err != nil {
+			results <- resultFromRecord(pending.record, err)
 			continue
 		}
 
-		if p.cfg.Cleanup {
-			if err := p.client.Remove(ctx, dumpPath); err != nil {
-				results <- resultFromRecord(record, err)
-				continue
+		configData, err := p.resolveConfigForDump(pending, sidecars)
+		if err == nil {
+			poolName, poolErr := p.resolvePoolForDump(pending, poolSidecars)
+			if poolErr != nil {
+				err = poolErr
+			} else {
+				err = p.restoreDump(ctx, pending.dumpPath, pending.vmType, pending.vmid, configData, poolName)
 			}
 		}
 
-		results <- resultFromRecord(record, nil)
+		if err == nil && p.cfg.Cleanup {
+			if removeErr := p.client.Remove(ctx, pending.dumpPath); removeErr != nil {
+				err = removeErr
+			}
+		}
+
+		results <- resultFromRecord(pending.record, err)
 	}
 
 	return nil
@@ -132,15 +205,101 @@ func (p *ProxmoxExporter) writeDump(ctx context.Context, dumpPath string, reader
 	return writer.Close()
 }
 
-func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int) error {
-	if err := p.stopVM(ctx, vmType, vmid); err != nil {
+func (p *ProxmoxExporter) collectConfigSidecar(record *connectors.Record, sidecarBase string, sidecars map[string]vmConfigSidecar) error {
+	dumpBase, vmType, err := proxmox.ParseConfigSidecarFilename(sidecarBase)
+	if err != nil {
 		return err
 	}
 
+	configData, err := readRecordBytes(record)
+	if err != nil {
+		return err
+	}
+
+	sidecars[dumpBase] = vmConfigSidecar{
+		vmType: vmType,
+		data:   configData,
+	}
+	return nil
+}
+
+func (p *ProxmoxExporter) resolveConfigForDump(pending pendingRestore, sidecars map[string]vmConfigSidecar) ([]byte, error) {
+	sidecar, ok := sidecars[pending.dumpBase]
+	if !ok {
+		return nil, nil
+	}
+	if sidecar.vmType != pending.vmType {
+		return nil, fmt.Errorf("config sidecar type mismatch for dump %s: got %s, expected %s", pending.dumpBase, sidecar.vmType, pending.vmType)
+	}
+	return sidecar.data, nil
+}
+
+func (p *ProxmoxExporter) collectPoolSidecar(record *connectors.Record, sidecarBase string, sidecars map[string]string) error {
+	dumpBase, err := proxmox.ParsePoolSidecarFilename(sidecarBase)
+	if err != nil {
+		return err
+	}
+
+	poolData, err := readRecordBytes(record)
+	if err != nil {
+		return err
+	}
+	sidecars[dumpBase] = strings.TrimSpace(string(poolData))
+	return nil
+}
+
+func (p *ProxmoxExporter) resolvePoolForDump(pending pendingRestore, sidecars map[string]string) (string, error) {
+	poolName, ok := sidecars[pending.dumpBase]
+	if !ok {
+		return "", nil
+	}
+	return strings.TrimSpace(poolName), nil
+}
+
+func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType string, vmid int, configData []byte, poolName string) error {
+	state, err := p.vmState(ctx, vmType, vmid)
+	if err != nil {
+		return err
+	}
+
+	if state.exists && state.running {
+		return fmt.Errorf("refusing restore for %s %d: VM/CT is running (stop it first)", vmType, vmid)
+	}
+
+	opts := restoreOptions{}
+
+	if !state.exists {
+		if storage := parseStorageFromConfig(vmType, configData); storage != "" {
+			opts.storage = storage
+		}
+		if poolName != "" {
+			exists, err := p.client.PoolExists(ctx, poolName)
+			if err != nil {
+				return err
+			}
+			if exists {
+				opts.pool = poolName
+			}
+		}
+	}
+
+	if err := p.runRestoreDump(ctx, dumpPath, vmType, vmid, opts); err != nil {
+		return err
+	}
+
+	if p.cfg.StartOnRestore {
+		if err := p.startVM(ctx, vmType, vmid); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType string, vmid int, opts restoreOptions) error {
 	vmidStr := strconv.Itoa(vmid)
 	var cmd string
 	var args []string
-
 	switch vmType {
 	case "qemu":
 		cmd = "qmrestore"
@@ -151,6 +310,12 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 	default:
 		return fmt.Errorf("unsupported backup type: %s", vmType)
 	}
+	if opts.storage != "" {
+		args = append(args, "--storage", opts.storage)
+	}
+	if opts.pool != "" {
+		args = append(args, "--pool", opts.pool)
+	}
 
 	_, stderr, err := p.client.Run(ctx, cmd, args...)
 	if err != nil {
@@ -160,45 +325,190 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 	return nil
 }
 
-func (p *ProxmoxExporter) stopVM(ctx context.Context, vmType string, vmid int) error {
-	vmidStr := strconv.Itoa(vmid)
-	var cmd string
-
-	switch vmType {
-	case "qemu":
-		cmd = "qm"
-	case "lxc":
-		cmd = "pct"
-	default:
-		return fmt.Errorf("unsupported backup type: %s", vmType)
+func (p *ProxmoxExporter) vmState(ctx context.Context, vmType string, vmid int) (vmRuntimeState, error) {
+	cmd, err := vmCommand(vmType)
+	if err != nil {
+		return vmRuntimeState{}, err
 	}
 
-	stdout, stderr, err := p.client.Run(ctx, cmd, "stop", vmidStr)
+	vmidStr := strconv.Itoa(vmid)
+	stdout, stderr, err := p.client.Run(ctx, cmd, "status", vmidStr)
+	output := preferredOutput(stdout, stderr)
 	if err != nil {
-		output := strings.TrimSpace(stderr)
-		if output == "" {
-			output = strings.TrimSpace(stdout)
+		if isMissingVMError(output) {
+			return vmRuntimeState{exists: false, running: false}, nil
 		}
-		if isIgnorableStopError(output) {
+		return vmRuntimeState{}, fmt.Errorf("status failed for %s %d: %w: %s", vmType, vmid, err, output)
+	}
+
+	status := parseStatusValue(stdout + "\n" + stderr)
+	switch status {
+	case "running", "paused", "suspended":
+		return vmRuntimeState{exists: true, running: true}, nil
+	case "stopped":
+		return vmRuntimeState{exists: true, running: false}, nil
+	default:
+		return vmRuntimeState{}, fmt.Errorf("unable to parse status for %s %d: %s", vmType, vmid, preferredOutput(stdout, stderr))
+	}
+}
+
+func (p *ProxmoxExporter) startVM(ctx context.Context, vmType string, vmid int) error {
+	cmd, err := vmCommand(vmType)
+	if err != nil {
+		return err
+	}
+
+	vmidStr := strconv.Itoa(vmid)
+	stdout, stderr, err := p.client.Run(ctx, cmd, "start", vmidStr)
+	if err != nil {
+		output := preferredOutput(stdout, stderr)
+		if isIgnorableStartError(output) {
 			return nil
 		}
-		return fmt.Errorf("stop failed for %s %d: %w: %s", vmType, vmid, err, output)
+		return fmt.Errorf("start failed for %s %d: %w: %s", vmType, vmid, err, output)
 	}
 
 	return nil
 }
 
-func isIgnorableStopError(output string) bool {
+func vmCommand(vmType string) (string, error) {
+	switch vmType {
+	case "qemu":
+		return "qm", nil
+	case "lxc":
+		return "pct", nil
+	default:
+		return "", fmt.Errorf("unsupported backup type: %s", vmType)
+	}
+}
+
+func isIgnorableStartError(output string) bool {
+	normalized := strings.ToLower(output)
+	return strings.Contains(normalized, "already running")
+}
+
+func isMissingVMError(output string) bool {
 	if output == "" {
 		return false
 	}
 	normalized := strings.ToLower(output)
-	return strings.Contains(normalized, "not running") ||
-		strings.Contains(normalized, "already stopped") ||
-		strings.Contains(normalized, "does not exist") ||
+	return strings.Contains(normalized, "does not exist") ||
 		strings.Contains(normalized, "no such vm") ||
 		strings.Contains(normalized, "no such container") ||
 		strings.Contains(normalized, "configuration file")
+}
+
+func preferredOutput(stdout, stderr string) string {
+	output := strings.TrimSpace(stderr)
+	if output == "" {
+		output = strings.TrimSpace(stdout)
+	}
+	return output
+}
+
+func parseStatusValue(output string) string {
+	for _, line := range strings.Split(strings.ToLower(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "status:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "status:"))
+		}
+	}
+	return ""
+}
+
+func parseStorageFromConfig(vmType string, configData []byte) string {
+	if len(configData) == 0 {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(configData), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.ToLower(key))
+		value = strings.TrimSpace(value)
+
+		switch vmType {
+		case "lxc":
+			if key == "rootfs" {
+				if storage := parseStorageFromVolumeSpec(value); storage != "" {
+					return storage
+				}
+			}
+		case "qemu":
+			if !isQEMUDiskConfigKey(key) {
+				continue
+			}
+			if storage := parseStorageFromVolumeSpec(value); storage != "" {
+				return storage
+			}
+		}
+	}
+
+	return ""
+}
+
+func parseStorageFromVolumeSpec(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return ""
+	}
+
+	volume := strings.Split(spec, ",")[0]
+	volume = strings.TrimSpace(volume)
+	if volume == "" {
+		return ""
+	}
+
+	storage, _, ok := strings.Cut(volume, ":")
+	if !ok {
+		return ""
+	}
+	storage = strings.TrimSpace(storage)
+	if storage == "" {
+		return ""
+	}
+
+	// Ignore explicit "none" values used in some optional disk entries.
+	if strings.EqualFold(storage, "none") {
+		return ""
+	}
+	return storage
+}
+
+func isQEMUDiskConfigKey(key string) bool {
+	return strings.HasPrefix(key, "scsi") ||
+		strings.HasPrefix(key, "virtio") ||
+		strings.HasPrefix(key, "sata") ||
+		strings.HasPrefix(key, "ide") ||
+		strings.HasPrefix(key, "efidisk") ||
+		strings.HasPrefix(key, "tpmstate")
+}
+
+func readRecordBytes(record *connectors.Record) ([]byte, error) {
+	if record.Reader == nil {
+		return nil, fmt.Errorf("missing record reader for %s", record.Pathname)
+	}
+
+	data, readErr := io.ReadAll(record.Reader)
+	closeErr := closeRecord(record)
+	if readErr != nil && closeErr != nil {
+		return nil, errors.Join(readErr, closeErr)
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+
+	return data, nil
 }
 
 func closeRecord(record *connectors.Record) error {
