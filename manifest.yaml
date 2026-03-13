@@ -12,8 +12,14 @@ connectors:
   homepage: https://github.com/gillesdubois/plakar-integration-proxmox
   license: ISC
   protocols: [proxmox+backup]
+  validator: ./importer/schema.json
+  class: hypervisor
+  subclass: proxmox
 - type: exporter
   executable: proxmoxExporter
   homepage: https://github.com/gillesdubois/plakar-integration-proxmox
   license: ISC
   protocols: [proxmox+backup]
+  validator: ./exporter/schema.json
+  class: hypervisor
+  subclass: proxmox
