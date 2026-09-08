@@ -18,10 +18,13 @@ package exporter
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"path"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +38,7 @@ import (
 type ProxmoxExporter struct {
 	cfg         *proxmox.Config
 	client      *proxmox.Client
+	temp        *proxmox.TempFiles
 	restoreOpts restoreOptions
 }
 
@@ -59,6 +63,8 @@ type vmRuntimeState struct {
 type restoreOptions struct {
 	startOnRestore bool
 	forceVMRestore bool
+	unique         bool
+	uniqueSet      bool
 	newID          int
 	storage        string
 	pool           string
@@ -91,6 +97,7 @@ func NewProxmoxExporter(ctx context.Context, opts *connectors.Options, name stri
 	return &ProxmoxExporter{
 		cfg:         cfg,
 		client:      client,
+		temp:        proxmox.NewTempFiles(client, cfg.Cleanup),
 		restoreOpts: restoreOpts,
 	}, nil
 }
@@ -101,11 +108,33 @@ func (p *ProxmoxExporter) Root() string          { return "/" }
 func (p *ProxmoxExporter) Flags() location.Flags { return 0 }
 
 func (p *ProxmoxExporter) Ping(ctx context.Context) error {
-	return p.client.Ping(ctx)
+	if err := p.client.Ping(ctx); err != nil {
+		return err
+	}
+	return p.preflight(ctx)
+}
+
+// preflight checks what a restore depends on before any archive is uploaded.
+func (p *ProxmoxExporter) preflight(ctx context.Context) error {
+	if err := p.client.CheckCommands(ctx, "pvesh", "qm", "pct", "qmrestore"); err != nil {
+		return err
+	}
+	return p.client.CheckDumpDir(ctx)
 }
 
 func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors.Record, results chan<- *connectors.Result) error {
 	defer close(results)
+
+	// Whatever is still tracked at this point was left behind by a failure
+	// between the upload and the restore.
+	defer p.temp.Sweep(ctx)
+
+	if err := p.preflight(ctx); err != nil {
+		// The records channel still has to be drained: the SDK blocks on it
+		// until every record has been consumed and its reader closed.
+		drainRecords(records, results, err)
+		return err
+	}
 
 	sidecars := make(map[string]vmConfigSidecar)
 	poolSidecars := make(map[string]string)
@@ -152,8 +181,16 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			continue
 		}
 
+		if err := p.client.EnsureFreeSpace(ctx, p.cfg.DumpDir, record.FileInfo.Lsize); err != nil {
+			results <- record.Error(err)
+			continue
+		}
+
 		dumpName := proxmox.BuildRestoreDumpFilename(base, vmType, vmid, time.Now())
 		dumpPath := path.Join(p.cfg.DumpDir, dumpName)
+
+		// Tracked before the write, so a partial upload is cleaned up too.
+		p.temp.Track(dumpPath)
 		if err := p.writeDump(ctx, dumpPath, record.Reader); err != nil {
 			results <- record.Error(err)
 			continue
@@ -194,8 +231,12 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 			}
 		}
 
-		if err == nil && p.cfg.Cleanup {
-			if removeErr := p.client.Remove(ctx, pending.dumpPath); removeErr != nil {
+		// Cleanup runs whether the restore worked or not: a restore that keeps
+		// failing is exactly the one that would fill dump_dir. It is a no-op
+		// when cleanup=false.
+		if removeErr := p.temp.Remove(ctx, pending.dumpPath); removeErr != nil {
+			proxmox.Warnf("unable to remove temporary dump %s: %v", pending.dumpPath, removeErr)
+			if err == nil {
 				err = removeErr
 			}
 		}
@@ -207,7 +248,16 @@ func (p *ProxmoxExporter) Export(ctx context.Context, records <-chan *connectors
 }
 
 func (p *ProxmoxExporter) Close(ctx context.Context) error {
+	p.temp.Sweep(ctx)
 	return p.client.Close()
+}
+
+// drainRecords consumes and fails every remaining record, so the SDK's sender
+// is never left blocked on a channel nobody reads.
+func drainRecords(records <-chan *connectors.Record, results chan<- *connectors.Result, err error) {
+	for record := range records {
+		results <- record.Error(err)
+	}
 }
 
 func (p *ProxmoxExporter) writeDump(ctx context.Context, dumpPath string, reader io.Reader) error {
@@ -280,19 +330,25 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 		return err
 	}
 
-	if state.exists && state.running {
+	if state.exists {
+		// Restoring over an existing VM/CT destroys its current disks and
+		// cannot be undone, so it stays behind an explicit opt-in whatever its
+		// runtime state is. A stopped VM used to be overwritten silently.
 		if !p.restoreOpts.forceVMRestore {
-			return fmt.Errorf("refusing restore for %s %d: VM/CT is running (stop it first or user force_vm_restore)", vmType, vmid)
+			return fmt.Errorf("refusing restore for %s %d: it already exists on %s (pass -o force_vm_restore=true to overwrite it, or -o newid=<id> to restore next to it)", vmType, vmid, p.cfg.Origin())
 		}
-		if err := p.stopVM(ctx, vmType, vmid); err != nil {
-			return err
-		}
-		state, err = p.vmState(ctx, vmType, vmid)
-		if err != nil {
-			return err
-		}
+
 		if state.running {
-			return fmt.Errorf("refusing restore for %s %d: VM/CT is still running after stop request", vmType, vmid)
+			if err := p.stopVM(ctx, vmType, vmid); err != nil {
+				return err
+			}
+			state, err = p.vmState(ctx, vmType, vmid)
+			if err != nil {
+				return err
+			}
+			if state.running {
+				return fmt.Errorf("refusing restore for %s %d: VM/CT is still running after stop request", vmType, vmid)
+			}
 		}
 	}
 
@@ -303,6 +359,12 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 
 	if err := p.runRestoreDump(ctx, dumpPath, vmType, vmid, opts); err != nil {
 		return err
+	}
+
+	if opts.unique && vmType == "qemu" {
+		if err := p.regenerateSMBIOSUUID(ctx, vmid); err != nil {
+			return err
+		}
 	}
 
 	if p.restoreOpts.startOnRestore {
@@ -317,6 +379,12 @@ func (p *ProxmoxExporter) restoreDump(ctx context.Context, dumpPath, vmType stri
 func (p *ProxmoxExporter) resolveRestoreOptions(ctx context.Context, vmType string, targetExists bool, configData []byte, poolName string) (restoreOptions, error) {
 	opts := p.restoreOpts
 
+	// A restore under a new VMID is a copy living next to its source, so it must
+	// not come up holding the same identity on the same network.
+	if !opts.uniqueSet {
+		opts.unique = opts.newID != 0
+	}
+
 	if !targetExists {
 		if opts.storage == "" {
 			opts.storage = parseStorageFromConfig(vmType, configData)
@@ -328,6 +396,8 @@ func (p *ProxmoxExporter) resolveRestoreOptions(ctx context.Context, vmType stri
 			}
 			if exists {
 				opts.pool = poolName
+			} else {
+				proxmox.Warnf("pool %q recorded in the backup no longer exists on %s: the restored VM/CT will not belong to any pool (use -o pool=<name> to pick another one)", poolName, p.cfg.Origin())
 			}
 		}
 	}
@@ -352,12 +422,19 @@ func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType s
 	switch vmType {
 	case "qemu":
 		cmd = "qmrestore"
-		args = []string{dumpPath, vmidStr, "--force"}
+		args = []string{dumpPath, vmidStr}
 	case "lxc":
 		cmd = "pct"
-		args = []string{"restore", vmidStr, dumpPath, "--force"}
+		args = []string{"restore", vmidStr, dumpPath}
 	default:
 		return fmt.Errorf("unsupported backup type: %s", vmType)
+	}
+
+	if opts.forceVMRestore {
+		args = append(args, "--force")
+	}
+	if opts.unique {
+		args = append(args, "--unique")
 	}
 	if opts.storage != "" {
 		args = append(args, "--storage", opts.storage)
@@ -372,6 +449,66 @@ func (p *ProxmoxExporter) runRestoreDump(ctx context.Context, dumpPath, vmType s
 	}
 
 	return nil
+}
+
+// regenerateSMBIOSUUID gives a restored QEMU VM its own SMBIOS UUID.
+//
+// --unique only randomises MAC addresses; guest software and inventories keyed
+// on the SMBIOS UUID would still see two identical machines.
+func (p *ProxmoxExporter) regenerateSMBIOSUUID(ctx context.Context, vmid int) error {
+	configData, err := p.client.ReadQEMUConfig(ctx, vmid)
+	if err != nil {
+		return fmt.Errorf("restore of qemu %d succeeded but its smbios settings could not be read: %w", vmid, err)
+	}
+
+	smbios, err := uniqueSMBIOS(configData)
+	if err != nil {
+		return fmt.Errorf("restore of qemu %d succeeded but a new smbios uuid could not be generated: %w", vmid, err)
+	}
+
+	if _, stderr, err := p.client.Run(ctx, "qm", "set", strconv.Itoa(vmid), "--smbios1", smbios); err != nil {
+		return fmt.Errorf("restore of qemu %d succeeded but its smbios uuid could not be replaced: %w: %s", vmid, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// uniqueSMBIOS rebuilds the smbios1 property string around a fresh uuid, keeping
+// every other field the VM already declared.
+func uniqueSMBIOS(configData []byte) (string, error) {
+	uuid, err := randomUUID()
+	if err != nil {
+		return "", err
+	}
+
+	var current string
+	for _, entry := range activeConfigEntries(configData) {
+		if entry[0] == "smbios1" {
+			current = entry[1]
+			break
+		}
+	}
+	if current == "" {
+		return "uuid=" + uuid, nil
+	}
+
+	fields := strings.Split(current, ",")
+	for i, field := range fields {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(field)), "uuid=") {
+			fields[i] = "uuid=" + uuid
+			return strings.Join(fields, ","), nil
+		}
+	}
+	return strings.Join(append(fields, "uuid="+uuid), ","), nil
+}
+
+func randomUUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 1
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
 func (p *ProxmoxExporter) vmState(ctx context.Context, vmType string, vmid int) (vmRuntimeState, error) {
@@ -476,11 +613,10 @@ func isIgnorableStartError(output string) bool {
 
 func isIgnorableStopError(output string) bool {
 	normalized := strings.ToLower(output)
-	return strings.Contains(normalized, "already stopped") ||
-		strings.Contains(normalized, "already down") ||
-		strings.Contains(normalized, "does not exist") ||
-		strings.Contains(normalized, "no such vm") ||
-		strings.Contains(normalized, "no such container")
+	if strings.Contains(normalized, "already stopped") || strings.Contains(normalized, "already down") {
+		return true
+	}
+	return isMissingVMError(output)
 }
 
 func parseBoolOption(value string) (bool, error) {
@@ -510,6 +646,16 @@ func parseRestoreOptions(config map[string]string) (restoreOptions, error) {
 	}
 	opts.forceVMRestore = forceVMRestore
 
+	// Left unset, uniqueness follows newid: see resolveRestoreOptions.
+	if uniqueRaw, ok := config["unique"]; ok && strings.TrimSpace(uniqueRaw) != "" {
+		unique, err := parseBoolOption(uniqueRaw)
+		if err != nil {
+			return restoreOptions{}, fmt.Errorf("invalid unique value: %s", strings.TrimSpace(uniqueRaw))
+		}
+		opts.unique = unique
+		opts.uniqueSet = true
+	}
+
 	opts.storage = strings.TrimSpace(config["storage"])
 	opts.pool = strings.TrimSpace(config["pool"])
 
@@ -531,15 +677,31 @@ func parseRestoreOptions(config map[string]string) (restoreOptions, error) {
 	return opts, nil
 }
 
+// missingVMPatterns match the ways Proxmox says a VM/CT is not on this node.
+var missingVMPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)configuration file '[^']*' does not exist`),
+	regexp.MustCompile(`(?i)unable to find configuration file for (vm|ct) \d+`),
+	regexp.MustCompile(`(?i)\b(vm|ct|container) \d+ does not exist\b`),
+	regexp.MustCompile(`(?i)\bno such (vm|container)\b`),
+}
+
+// isMissingVMError tells "the target is not there" apart from any other failure.
+//
+// Matching a bare "does not exist", or the words "configuration file" on their
+// own, was far too loose: a permission problem or a pmxcfs that lost quorum
+// mentions those too, and reading such an error as "the VMID is free" leads
+// straight to overwriting a VM that does exist.
 func isMissingVMError(output string) bool {
-	if output == "" {
+	if strings.TrimSpace(output) == "" {
 		return false
 	}
-	normalized := strings.ToLower(output)
-	return strings.Contains(normalized, "does not exist") ||
-		strings.Contains(normalized, "no such vm") ||
-		strings.Contains(normalized, "no such container") ||
-		strings.Contains(normalized, "configuration file")
+
+	for _, pattern := range missingVMPatterns {
+		if pattern.MatchString(output) {
+			return true
+		}
+	}
+	return false
 }
 
 func preferredOutput(stdout, stderr string) string {
@@ -560,42 +722,142 @@ func parseStatusValue(output string) string {
 	return ""
 }
 
+// qemuDiskKeyRegex matches the QEMU config keys that carry a guest disk.
+//
+// efidisk0 and tpmstate0 deliberately fall outside it: they are small auxiliary
+// volumes that say nothing about where the VM's actual disks belong.
+var qemuDiskKeyRegex = regexp.MustCompile(`^(scsi|virtio|sata|ide|nvme)\d+$`)
+
+// parseStorageFromConfig picks the storage a restore should target, from the
+// config sidecar kept alongside the dump.
 func parseStorageFromConfig(vmType string, configData []byte) string {
 	if len(configData) == 0 {
 		return ""
 	}
+
+	switch vmType {
+	case "qemu":
+		return parseQEMUStorage(configData)
+	case "lxc":
+		return parseLXCStorage(configData)
+	default:
+		return ""
+	}
+}
+
+// activeConfigEntries returns the key/value pairs of the live configuration.
+//
+// A Proxmox config file lists one "[snapname]" section per snapshot after the
+// active configuration, each with its own disk lines; reading past the first
+// section would resolve a storage the VM does not use any more.
+func activeConfigEntries(configData []byte) [][2]string {
+	entries := make([][2]string, 0)
 
 	for _, line := range strings.Split(string(configData), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		if strings.HasPrefix(line, "[") {
+			break
+		}
 
 		key, value, ok := strings.Cut(line, ":")
 		if !ok {
 			continue
 		}
-		key = strings.TrimSpace(strings.ToLower(key))
-		value = strings.TrimSpace(value)
 
-		switch vmType {
-		case "lxc":
-			if key == "rootfs" {
-				if storage := parseStorageFromVolumeSpec(value); storage != "" {
-					return storage
-				}
-			}
-		case "qemu":
-			if !isQEMUDiskConfigKey(key) {
-				continue
-			}
-			if storage := parseStorageFromVolumeSpec(value); storage != "" {
-				return storage
-			}
+		entries = append(entries, [2]string{
+			strings.TrimSpace(strings.ToLower(key)),
+			strings.TrimSpace(value),
+		})
+	}
+
+	return entries
+}
+
+// parseQEMUStorage resolves the storage holding the VM's boot disk.
+//
+// Returning the first disk-looking line instead used to pick whatever sorted
+// first in the file: efidisk0 on a UEFI VM, and the ISO datastore of
+// "ide2: local:iso/...,media=cdrom" on a BIOS one. Since the result is passed
+// as --storage, which relocates every disk, that sent VMs to the wrong storage.
+func parseQEMUStorage(configData []byte) string {
+	disks := make(map[string]string)
+	keys := make([]string, 0)
+	var bootOrder []string
+
+	for _, entry := range activeConfigEntries(configData) {
+		key, value := entry[0], entry[1]
+
+		if key == "boot" {
+			bootOrder = parseBootOrder(value)
+			continue
+		}
+		if !qemuDiskKeyRegex.MatchString(key) || isCDROMVolume(value) {
+			continue
+		}
+
+		storage := parseStorageFromVolumeSpec(value)
+		if storage == "" {
+			continue
+		}
+		disks[key] = storage
+		keys = append(keys, key)
+	}
+
+	for _, device := range bootOrder {
+		if storage, ok := disks[device]; ok {
+			return storage
 		}
 	}
 
+	// No usable boot order: fall back to the first data disk, by device name.
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		return disks[keys[0]]
+	}
 	return ""
+}
+
+func parseLXCStorage(configData []byte) string {
+	for _, entry := range activeConfigEntries(configData) {
+		if entry[0] == "rootfs" {
+			return parseStorageFromVolumeSpec(entry[1])
+		}
+	}
+	return ""
+}
+
+// parseBootOrder reads the devices of a "boot: order=scsi0;ide2" line.
+//
+// The legacy letter form ("boot: cdn") names device classes rather than
+// devices, and carries nothing usable here.
+func parseBootOrder(value string) []string {
+	for _, part := range strings.Split(value, ",") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(part), "order=")
+		if !ok {
+			continue
+		}
+
+		devices := make([]string, 0)
+		for _, device := range strings.Split(rest, ";") {
+			if device = strings.ToLower(strings.TrimSpace(device)); device != "" {
+				devices = append(devices, device)
+			}
+		}
+		return devices
+	}
+	return nil
+}
+
+func isCDROMVolume(spec string) bool {
+	for _, part := range strings.Split(spec, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "media=cdrom") {
+			return true
+		}
+	}
+	return false
 }
 
 func parseStorageFromVolumeSpec(spec string) string {
@@ -624,15 +886,6 @@ func parseStorageFromVolumeSpec(spec string) string {
 		return ""
 	}
 	return storage
-}
-
-func isQEMUDiskConfigKey(key string) bool {
-	return strings.HasPrefix(key, "scsi") ||
-		strings.HasPrefix(key, "virtio") ||
-		strings.HasPrefix(key, "sata") ||
-		strings.HasPrefix(key, "ide") ||
-		strings.HasPrefix(key, "efidisk") ||
-		strings.HasPrefix(key, "tpmstate")
 }
 
 func readRecordBytes(record *connectors.Record) ([]byte, error) {
