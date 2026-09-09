@@ -28,17 +28,12 @@ var (
 	warnTo io.Writer = os.Stderr
 )
 
-// Warnf reports a non-fatal condition to the operator.
-//
-// Connectors run as plugins that speak gRPC over stdin/stdout, so stderr is the
-// only stream a connector can write to without corrupting the protocol.
 func Warnf(format string, args ...any) {
 	warnMu.Lock()
 	defer warnMu.Unlock()
 	fmt.Fprintf(warnTo, "proxmox: warning: "+format+"\n", args...)
 }
 
-// SetWarnWriter redirects warnings, for tests.
 func SetWarnWriter(w io.Writer) func() {
 	warnMu.Lock()
 	previous := warnTo

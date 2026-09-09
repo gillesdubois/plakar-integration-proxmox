@@ -28,9 +28,6 @@ import (
 const FreeSpaceMargin = 256 << 20
 
 // CheckCommands verifies the given Proxmox tools are reachable on the target.
-//
-// A missing binary then surfaces before any VM is touched, instead of as an
-// opaque exit status in the middle of a job.
 func (c *Client) CheckCommands(ctx context.Context, names ...string) error {
 	for _, name := range names {
 		if _, _, err := c.runner.Run(ctx, "sh", "-c", "command -v "+name+" >/dev/null 2>&1"); err != nil {
@@ -41,9 +38,6 @@ func (c *Client) CheckCommands(ctx context.Context, names ...string) error {
 }
 
 // CheckDumpDir verifies dump_dir exists and is writable.
-//
-// Without it a bad path is only reported once the archive has been streamed,
-// because "cat > file" starts successfully whatever the destination is.
 func (c *Client) CheckDumpDir(ctx context.Context) error {
 	if _, _, err := c.runner.Run(ctx, "test", "-d", c.cfg.DumpDir); err != nil {
 		return fmt.Errorf("dump_dir %s does not exist on %s", c.cfg.DumpDir, c.cfg.Origin())
@@ -64,9 +58,6 @@ func (c *Client) AvailableBytes(ctx context.Context, dir string) (int64, error) 
 }
 
 // EnsureFreeSpace refuses a transfer that dir cannot hold.
-//
-// A failed space check is only a warning: it must never block a restore that
-// would otherwise have worked, on a filesystem df cannot report on.
 func (c *Client) EnsureFreeSpace(ctx context.Context, dir string, size int64) error {
 	if size <= 0 {
 		return nil

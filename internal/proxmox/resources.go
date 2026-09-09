@@ -115,12 +115,6 @@ func (c *Client) ListPoolVMIDs(ctx context.Context, pool string) ([]int, error) 
 	return vmids, nil
 }
 
-// filterVMIDs selects the backup-able VM/CT of an inventory, and returns the
-// ones deliberately left out so the caller can report them.
-//
-// A resource whose status is "unknown" lives on a node the cluster cannot reach:
-// dumping it is a guaranteed failure, so it is skipped rather than allowed to
-// break the run. Templates are kept, vzdump handles them fine.
 func filterVMIDs(resources []vmResource, node string) ([]int, []vmResource) {
 	set := make(map[int]struct{})
 	skipped := make([]vmResource, 0)

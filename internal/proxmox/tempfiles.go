@@ -24,9 +24,6 @@ import (
 
 // TempFiles tracks the artefacts an operation leaves in dump_dir so they are
 // removed on every exit path, failures included.
-//
-// Cleaning up only on success is the wrong way round: a job that keeps failing
-// is exactly the one that fills the node's filesystem.
 type TempFiles struct {
 	client  *Client
 	enabled bool
@@ -73,8 +70,6 @@ func (t *TempFiles) Remove(ctx context.Context, filepath string) error {
 		return err
 	}
 
-	// vzdump writes its log next to the archive; it is not always there, so a
-	// failure here is never worth reporting.
 	if logPath := DumpLogPath(filepath); logPath != "" {
 		_ = t.client.Remove(ctx, logPath)
 	}
@@ -83,18 +78,12 @@ func (t *TempFiles) Remove(ctx context.Context, filepath string) error {
 
 // Adopt hands a tracked file over to a reader: the file lives until that reader
 // is closed, then is removed.
-//
-// The SDK forwards a record to plakar and only streams its content afterwards,
-// so an archive removed as soon as it is emitted can be pulled out from under
-// the reader that is about to be handed to plakar.
 func (t *TempFiles) Adopt(ctx context.Context, filepath string, reader io.ReadCloser) io.ReadCloser {
 	t.Forget(filepath)
 	if !t.enabled {
 		return reader
 	}
 
-	// The caller's context is usually already cancelled by the time cleanup
-	// runs on a failed job, which is precisely when cleanup matters most.
 	cleanupCtx := context.WithoutCancel(ctx)
 
 	return &cleanupReadCloser{
