@@ -91,6 +91,16 @@
       "description": "Delay between SSH retries when mode=remote, as a Go duration (e.g. \"2s\")",
       "default": "2s"
     },
+    "ssh_known_hosts": {
+      "type": "string",
+      "description": "Path to the known_hosts file used to verify the Proxmox node host key when mode=remote",
+      "default": "~/.ssh/known_hosts"
+    },
+    "ssh_insecure_ignore_host_key": {
+      "type": "boolean",
+      "description": "Disable host key verification entirely. Leaves the connection open to man-in-the-middle attacks; use only on a trusted network.",
+      "default": false
+    },
     "start_on_restore": {
       "type": "boolean",
       "description": "Start VM/CT after successful restore",
