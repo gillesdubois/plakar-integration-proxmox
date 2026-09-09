@@ -28,11 +28,12 @@ import (
 const resourceCacheTTL = 15 * time.Second
 
 type vmResource struct {
-	VMID int    `json:"vmid"`
-	Type string `json:"type"`
-	Node string `json:"node"`
-	Name string `json:"name,omitempty"`
-	Pool string `json:"pool,omitempty"`
+	VMID   int    `json:"vmid"`
+	Type   string `json:"type"`
+	Node   string `json:"node"`
+	Name   string `json:"name,omitempty"`
+	Pool   string `json:"pool,omitempty"`
+	Status string `json:"status,omitempty"`
 }
 
 type poolResponse struct {
@@ -44,7 +45,9 @@ func (c *Client) ListAllVMIDs(ctx context.Context) ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	return filterVMIDs(resources, c.cfg.Node), nil
+	vmids, skipped := filterVMIDs(resources, c.cfg.Node)
+	warnSkippedResources(skipped)
+	return vmids, nil
 }
 
 func (c *Client) VMType(ctx context.Context, vmid int) (string, error) {
@@ -107,16 +110,24 @@ func (c *Client) ListPoolVMIDs(ctx context.Context, pool string) ([]int, error) 
 	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
 		return nil, fmt.Errorf("failed to parse pool response: %w", err)
 	}
-	return filterVMIDs(response.Members, c.cfg.Node), nil
+	vmids, skipped := filterVMIDs(response.Members, c.cfg.Node)
+	warnSkippedResources(skipped)
+	return vmids, nil
 }
 
-func filterVMIDs(resources []vmResource, node string) []int {
+func filterVMIDs(resources []vmResource, node string) ([]int, []vmResource) {
 	set := make(map[int]struct{})
+	skipped := make([]vmResource, 0)
+
 	for _, item := range resources {
 		if item.Type != "qemu" && item.Type != "lxc" {
 			continue
 		}
 		if node != "" && item.Node != node {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(item.Status), "unknown") {
+			skipped = append(skipped, item)
 			continue
 		}
 		set[item.VMID] = struct{}{}
@@ -127,7 +138,14 @@ func filterVMIDs(resources []vmResource, node string) []int {
 		vmids = append(vmids, vmid)
 	}
 	sort.Ints(vmids)
-	return vmids
+	return vmids, skipped
+}
+
+func warnSkippedResources(skipped []vmResource) {
+	for _, item := range skipped {
+		Warnf("skipping %s %d on node %q: the cluster reports its status as unknown (node unreachable?)",
+			item.Type, item.VMID, item.Node)
+	}
 }
 
 func (c *Client) vmResourceByID(ctx context.Context, vmid int) (vmResource, error) {
