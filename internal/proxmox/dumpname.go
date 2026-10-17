@@ -18,6 +18,7 @@ package proxmox
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -73,6 +74,31 @@ func BuildDumpFilename(_ *Config, vmType string, vmid int, timestamp, baseExt, c
 func BuildRestoreDumpFilename(originalName, vmType string, vmid int, now time.Time) string {
 	suffix := canonicalArchiveSuffix(originalName, vmType)
 	return fmt.Sprintf("vzdump-%s-%d-%s%s", vmType, vmid, now.Format("2006_01_02-15_04_05"), suffix)
+}
+
+// DumpLogPath returns the vzdump log file sitting next to an archive, or "" when
+// the name does not follow the vzdump convention.
+//
+// vzdump derives both names from one basename, so the archive
+// "vzdump-qemu-101-2026_01_01-00_00_00.vma.zst" comes with the log file
+// "vzdump-qemu-101-2026_01_01-00_00_00.log". Nothing ever removed those logs,
+// so every run used to leave one more file behind in dump_dir.
+func DumpLogPath(archivePath string) string {
+	base := path.Base(archivePath)
+	lower := strings.ToLower(base)
+
+	idx := -1
+	for _, ext := range []string{".vma", ".tar"} {
+		if at := strings.Index(lower, ext); at > 0 {
+			idx = at
+			break
+		}
+	}
+	if idx < 0 {
+		return ""
+	}
+
+	return path.Join(path.Dir(archivePath), base[:idx]+".log")
 }
 
 func BuildQEMUConfigSidecarFilename(archiveName string) string {

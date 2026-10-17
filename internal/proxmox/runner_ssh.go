@@ -19,6 +19,7 @@ package proxmox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +31,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type SSHRunner struct {
@@ -65,14 +67,20 @@ func NewSSHRunner(cfg *Config) (*SSHRunner, error) {
 		return nil, fmt.Errorf("unsupported conn_method: %s", cfg.ConnMethod)
 	}
 
+	addr := normalizeSSHAddr(cfg.Host)
+
+	verifyHostKey, err := hostKeyCallback(cfg, addr)
+	if err != nil {
+		return nil, err
+	}
+
 	clientCfg := &ssh.ClientConfig{
 		User:            cfg.ConnUsername,
 		Auth:            []ssh.AuthMethod{auth},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: verifyHostKey,
 		Timeout:         30 * time.Second,
 	}
 
-	addr := normalizeSSHAddr(cfg.Host)
 	dial := func() (*ssh.Client, error) {
 		return ssh.Dial("tcp", addr, clientCfg)
 	}
@@ -88,6 +96,74 @@ func NewSSHRunner(cfg *Config) (*SSHRunner, error) {
 		maxRetries: cfg.SSHRetryCount,
 		retryDelay: cfg.SSHRetryDelay,
 	}, nil
+}
+
+func hostKeyCallback(cfg *Config, addr string) (ssh.HostKeyCallback, error) {
+	if cfg.SSHInsecureIgnoreHostKey {
+		Warnf("host key verification is disabled for %s (ssh_insecure_ignore_host_key=true): "+
+			"credentials and VM images sent over this connection are not protected against a "+
+			"man-in-the-middle", addr)
+		return ssh.InsecureIgnoreHostKey(), nil
+	}
+
+	return knownHostsCallback(cfg.SSHKnownHosts, addr)
+}
+
+func knownHostsCallback(knownHostsPath, addr string) (ssh.HostKeyCallback, error) {
+	if knownHostsPath == "" {
+		return nil, fmt.Errorf("ssh_known_hosts is empty: set it, or set " +
+			"ssh_insecure_ignore_host_key=true")
+	}
+
+	if _, err := os.Stat(knownHostsPath); err != nil {
+		return nil, fmt.Errorf("unable to read ssh_known_hosts %s: %w (%s, or set "+
+			"ssh_insecure_ignore_host_key=true)",
+			knownHostsPath, err, keyscanHint(addr, knownHostsPath))
+	}
+
+	callback, err := knownhosts.New(knownHostsPath)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse ssh_known_hosts %s: %w", knownHostsPath, err)
+	}
+
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		if err := callback(hostname, remote, key); err != nil {
+			return hostKeyError(err, addr, knownHostsPath, key)
+		}
+		return nil
+	}, nil
+}
+
+func hostKeyError(err error, addr, knownHostsPath string, key ssh.PublicKey) error {
+	var keyErr *knownhosts.KeyError
+	if !errors.As(err, &keyErr) {
+		return err
+	}
+
+	if len(keyErr.Want) > 0 {
+		return fmt.Errorf("host key mismatch for %s: the node presented a %s key with fingerprint %s, "+
+			"which does not match the entry in %s. Either the node was reinstalled or rekeyed, or this "+
+			"is a man-in-the-middle. If the change is expected, drop the stale entry with: "+
+			"ssh-keygen -R %q -f %q",
+			addr, key.Type(), ssh.FingerprintSHA256(key), knownHostsPath,
+			knownhosts.Normalize(addr), knownHostsPath)
+	}
+
+	return fmt.Errorf("unknown host key for %s (%s, fingerprint %s): %s, or set "+
+		"ssh_insecure_ignore_host_key=true to skip verification",
+		addr, key.Type(), ssh.FingerprintSHA256(key), keyscanHint(addr, knownHostsPath))
+}
+
+func keyscanHint(addr, knownHostsPath string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host, port = addr, "22"
+	}
+
+	if port == "22" {
+		return fmt.Sprintf("add the node with: ssh-keyscan -H %s >> %s", host, knownHostsPath)
+	}
+	return fmt.Sprintf("add the node with: ssh-keyscan -H -p %s %s >> %s", port, host, knownHostsPath)
 }
 
 func (r *SSHRunner) newSession(ctx context.Context) (*ssh.Session, error) {

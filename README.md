@@ -39,14 +39,22 @@ The configuration parameters are as follows:
 - `cleanup` (optional): When `true`, delete temporary vzdump files from Proxmox storage after restore and after backups (defaults to `true`).
 - `ssh_retry_count` (optional, only used when `mode=remote`): Number of retries when an SSH action fails to open a channel/session (e.g. `ssh: rejected: connect failed (open failed)` on a stale connection). Defaults to `3`. Set to `0` to disable retries.
 - `ssh_retry_delay` (optional, only used when `mode=remote`): Delay to wait between SSH retries, as a Go duration (e.g. `2s`, `500ms`, `1m`). Defaults to `2s`.
+- `ssh_known_hosts` (optional, only used when `mode=remote`): Path to the `known_hosts` file used to verify the Proxmox node host key (defaults to `~/.ssh/known_hosts`).
+- `ssh_insecure_ignore_host_key` (optional, only used when `mode=remote`): When `true`, skip host key verification entirely (defaults to `false`).
 
 ## Restore behavior and options
 
 During restore, the exporter checks whether the target VM/CT exists and its runtime state:
 
-- **If it exists and is running**: restore is refused unless `-o force_vm_restore=true`, in which case the VM/CT is stopped before restore.
-- **If it exists and is stopped**: restore is performed in place.
-- **If it does not exist**: restore is performed from the dump. When a matching sidecar config file (`_qemu.conf` or `_lxc.conf`) is available, it may be used as a storage hint for restore. When a matching pool sidecar (`_pool.conf`) is available, the exporter checks that the pool still exists and then passes `--pool <pool>`.
+- **If the target VMID already exists**: restore is refused unless `-o force_vm_restore=true`.
+  Restoring over an existing VM/CT destroys its current disks and cannot be undone, so it is
+  always an explicit choice, whether the VM/CT is running or stopped. With the option set, a
+  running VM/CT is stopped first, then overwritten.
+- **If it does not exist**: restore is performed from the dump. When a matching sidecar config
+  file (`_qemu.conf` or `_lxc.conf`) is available, it is used as a storage hint. When a matching
+  pool sidecar (`_pool.conf`) is available, the exporter checks that the pool still exists and
+  then passes `--pool <pool>`; if the pool is gone, a warning is printed and the VM/CT is
+  restored without pool membership.
 - **After a successful restore**: the VM/CT is started when `-o start_on_restore=true`.
 - **Storage / pool override**:
   - `-o storage=<name>` forces the storage target used by restore, overriding the sidecar hint.
@@ -55,10 +63,32 @@ During restore, the exporter checks whether the target VM/CT exists and its runt
 Restore options are passed via the generic `-o` flag of `plakar restore`:
 
 - `start_on_restore=true|false` (`false` by default): start restored VM/CT after success.
-- `force_vm_restore=true|false` (`false` by default): if target VM/CT is running it is stopped; restore overwrites existing VM/CT when set.
+- `force_vm_restore=true|false` (`false` by default): allow the restore to overwrite an existing
+  VM/CT, stopping it first if it is running. Without it, a restore onto an existing VMID is refused.
+- `unique=true|false`: give the restored VM/CT a new identity instead of a copy of the source one:
+  random MAC addresses on every interface, and for QEMU a fresh SMBIOS UUID. **Defaults to `true`
+  when `newid` is set**, `false` otherwise. Set it explicitly to override that default.
 - `storage=<name>`: force target storage for restore.
 - `pool=<name>`: force target pool for restore.
 - `newid=<id>`: restore under another VMID than the one contained in the source dump.
+
+### About the storage hint
+
+`--storage` is not a per-disk setting: Proxmox applies it to **every** disk of the restored
+VM/CT. The sidecar hint therefore resolves a single storage, the one holding the guest's boot
+disk, following the `boot: order=` line of the saved configuration. CD-ROM entries
+(`media=cdrom`), EFI disks and TPM state are ignored: they say nothing about where the guest's
+actual disks belong.
+
+Recommended practice:
+
+- Restoring onto the **same cluster** it was backed up from: let the hint do its job, pass nothing.
+- Restoring onto a **different cluster**, or a node whose storage is named differently: pass
+  `-o storage=<name>` explicitly. The hint names a storage of the source cluster, which may not
+  exist on the target, and a restore that silently lands on the wrong storage is worse than one
+  that fails.
+- VMs whose disks are **spread over several storages**: the restore consolidates them onto one.
+  Pass `-o storage=` deliberately, then move the disks back afterwards if needed.
 
 ## Backup selection options
 
@@ -117,6 +147,9 @@ $ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=re
 # Configure a Proxmox remote source with custom SSH retry behavior
 $ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_identity_file=/path/to/somewhere/pmx_id conn_method=identity ssh_retry_count=5 ssh_retry_delay=5s
 
+# Configure a Proxmox remote source, without host key verification
+$ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=remote conn_username=root conn_method=password conn_password=aSecureAndStrongPass ssh_insecure_ignore_host_key=true
+
 # Backup VM / CT
 $ plakar at /tmp/example backup -o vmid=101 @myProxmoxHypervisorSrc
 $ plakar at /tmp/example backup -o pool=prod @myProxmoxHypervisorSrc
@@ -142,10 +175,12 @@ $ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>
 $ plakar at /tmp/example restore -to @myProxmoxHypervisorRemote <snapid>:/backup/qemu/101_myvm
 # Restore and restart after restore
 $ plakar at /tmp/example restore -o start_on_restore=true -to @myProxmoxHypervisorRemote <snapid> 
-# Restore existing VM by force (stop first if needed)
+# Restore over an existing VM (refused without this option, stops it first if running)
 $ plakar at /tmp/example restore -o force_vm_restore=true -to @myProxmoxHypervisorRemote <snapid> 
-# Restore to a different VMID and storage
-$ plakar at /tmp/example restore -o newid=201 -o storage=local-lvm -o pool=sharedpool-to @myProxmoxHypervisorRemote <snapid> 
+# Restore to a different VMID and storage (new MAC addresses and SMBIOS UUID by default)
+$ plakar at /tmp/example restore -o newid=201 -o storage=local-lvm -o pool=sharedpool -to @myProxmoxHypervisorRemote <snapid> 
+# Restore to a different VMID but keep the source identity (MAC addresses, SMBIOS UUID)
+$ plakar at /tmp/example restore -o newid=201 -o unique=false -to @myProxmoxHypervisorRemote <snapid> 
 ``` 
 
 ## Proxmox tools / commands used
@@ -161,33 +196,50 @@ Backup (importer) commands:
 - `vzdump <vmid> --dumpdir <dump_dir> --mode <snapshot|suspend|stop> --compress <0|1|lzo|gzip|zstd> [--node <node>]` (when `mode=local` and `mode=remote`)
 - `cat -- /etc/pve/qemu-server/<vmid>.conf` (for QEMU sidecar config file)
 - `cat -- /etc/pve/lxc/<vmid>.conf` (for LXC sidecar config file)
+- `sh -c 'command -v <tool>'` and `test -d`/`test -w <dump_dir>` (preflight, before any VM is touched)
+- `rm -f -- <dump_dir>/<archive>` and `rm -f -- <dump_dir>/<basename>.log` (when `cleanup=true`)
 
 Restore (exporter) commands:
+- `sh -c 'command -v <tool>'` and `test -d`/`test -w <dump_dir>` (preflight, before any upload)
+- `df -Pk <dump_dir>` (free space check, before each archive is uploaded)
 - `cat > <dump_dir>/<archive>` (write archive to Proxmox storage)
 - `qm status <vmid>` / `pct status <vmid>` (check existence and running state)
 - `pvesh get /pools/<pool> --output-format json` (only when a `_pool.conf` sidecar is present)
-- `qmrestore <dump_dir>/<archive> <vmid> --force [--storage <storage>] [--pool <pool>]` (QEMU)
-- `pct restore <vmid> <dump_dir>/<archive> --force [--storage <storage>] [--pool <pool>]` (LXC)
-- `qm stop <vmid>` / `pct stop <vmid>` (when `-o force_vm_restore=true`)
+- `qmrestore <dump_dir>/<archive> <vmid> [--force] [--unique] [--storage <storage>] [--pool <pool>]` (QEMU)
+- `pct restore <vmid> <dump_dir>/<archive> [--force] [--unique] [--storage <storage>] [--pool <pool>]` (LXC)
+- `qm set <vmid> --smbios1 uuid=<new-uuid>,...` (QEMU only, when `unique` applies)
+- `qm stop <vmid>` / `pct stop <vmid>` (when `-o force_vm_restore=true` and the VM/CT is running)
 - `qm start <vmid>` / `pct start <vmid>` (only when `-o start_on_restore=true`)
-- `rm -f -- <dump_dir>/<archive>` (when `cleanup=true`)
+- `rm -f -- <dump_dir>/<archive>` and `rm -f -- <dump_dir>/<basename>.log` (when `cleanup=true`)
 
 ## Technical / code overview 
 
 ### Backup Flow (Importer)
 
 1. Read config and validate options (local/remote mode, SSH auth, compression, backup mode, node, etc.).
-2. Resolve VM/CT selection: `vmid`, `pool`, or `all`.
-3. Retrieve the list via `pvesh`:
+2. Preflight the target: required Proxmox tools are present, `dump_dir` exists and is writable.
+3. Resolve VM/CT selection: `vmid`, `pool`, or `all`.
+4. Retrieve the list via `pvesh`:
    `pvesh get /cluster/resources --type vm` or `pvesh get /pools/<pool>`.
-4. For each VM/CT, detect the type (`qemu` or `lxc`) via Proxmox inventory.
-5. For each VM/CT, run `vzdump` to generate a dump file in `dump_dir`.
-6. Read the dump file and send it to Plakar under `/backup/<type>/<vmid>_<vmname>/` (VM name is sanitized for path safety).
-7. For QEMU and LXC, also export VM config files as sidecars:
+   Resources the cluster reports with an `unknown` status (node unreachable) are skipped with a
+   warning rather than attempted.
+5. For each VM/CT, detect the type (`qemu` or `lxc`) via Proxmox inventory.
+6. For each VM/CT, run `vzdump` to generate a dump file in `dump_dir`.
+7. Read the dump file and send it to Plakar under `/backup/<type>/<vmid>_<vmname>/` (VM name is sanitized for path safety).
+8. For QEMU and LXC, also export VM config files as sidecars:
    - QEMU: `/etc/pve/qemu-server/<vmid>.conf` as `/backup/qemu/<vmid>_<vmname>/<dump>_qemu.conf`
    - LXC: `/etc/pve/lxc/<vmid>.conf` as `/backup/lxc/<vmid>_<vmname>/<dump>_lxc.conf`
-8. If VM/CT belongs to a pool, export pool membership as `/backup/<type>/<vmid>_<vmname>/<dump>_pool.conf` (content is the pool name).
-9. `cleanup` option: generated dump file is removed from `dump_dir` after transfer (enabled by default).
+9. If VM/CT belongs to a pool, export pool membership as `/backup/<type>/<vmid>_<vmname>/<dump>_pool.conf` (content is the pool name).
+10. `cleanup` option: the generated dump file, and the `.log` vzdump writes next to it, are removed
+    from `dump_dir` (enabled by default). Removal happens once Plakar is done reading the archive,
+    and on failure paths too, so a job that keeps failing does not fill up `dump_dir`.
+
+### Partial failures
+
+A VM/CT that cannot be dumped (locked by a migration, a snapshot in progress, a missing disk, ...)
+does not cancel the run. The failure is reported as a failed entry for that VM/CT, a warning is
+printed on stderr, and the remaining selection is backed up normally. The backup only fails as a
+whole when *every* selected VM/CT failed.
 
 ### Restore Flow (Exporter)
 
@@ -195,20 +247,26 @@ Restore (exporter) commands:
 2. Collect sidecar configs (`_qemu.conf`, `_lxc.conf`) and map them to their dump names.
 3. For each dump file, parse the restore target from the filename (type + vmid), then write the dump into `dump_dir`.
 4. Check target existence and runtime state using `qm/pct status`.
-5. If VM/CT exists:
-   - if running: restore is refused unless `-o force_vm_restore=true`, in which case the VM/CT is stopped first.
-   - if stopped: restore dump in place.
+5. If the VM/CT exists, the restore is refused unless `-o force_vm_restore=true`; with that option
+   a running VM/CT is stopped first, then overwritten.
 6. If VM/CT does not exist, restore dump directly.
 7. Restore options from `plakar restore -o` are applied:
    - `start_on_restore=true|false` (`false` by default): start VM/CT after successful restore.
-   - `force_vm_restore=true|false` (`false` by default): if VM/CT is running, stop it before restore; if VM/CT exists, it is restored in place (overwrite).
+   - `force_vm_restore=true|false` (`false` by default): allow overwriting an existing VM/CT,
+     stopping it first if it is running.
+   - `unique=true|false` (defaults to `true` when `newid` is set): random MAC addresses, plus a new
+     SMBIOS UUID for QEMU.
    - `storage=<name>`: force restore storage,
    - `pool=<name>`: force restore pool (validated on target),
    - `newid=<id>`: restore to another VMID.
 8. Storage/pool precedence:
    - user-specified `storage` and `pool` override sidecar-derived hints when present.
-   - if target VMID does not exist and no override is set, storage and pool are read from matching sidecars when available.
-9. `cleanup` option: remove the temporary dump from `dump_dir`.
+   - if target VMID does not exist and no override is set, storage and pool are read from matching
+     sidecars when available. A pool that no longer exists on the target is reported as a warning
+     and dropped, instead of failing the restore.
+9. `cleanup` option: remove the temporary dump from `dump_dir`. It runs whether the restore
+   succeeded or not, so a failing restore does not leave multi-gigabyte archives behind. Set
+   `cleanup=false` to keep them for inspection.
 
 ### Remote Mode and SSH Notes
 
@@ -217,5 +275,3 @@ Remote mode exists to avoid installing extra binaries on the hypervisor and to c
 A single SSH connection is kept open and reused for the whole backup/restore job (vzdump execution, archive read/write, config/pool sidecar reads, cleanup, ...). On a long-running job (e.g. a large LXC/QEMU dump taking tens of minutes), that connection can become stale (idle timeouts on a NAT/firewall/VPN sitting between Plakar and Proxmox, a heavily loaded Proxmox node, a flaky link, ...), which typically surfaces as an SSH channel-open failure such as:
 
 To make this resilient, every SSH action (opening a channel to run a command, read/write a file, ...) is retried on failure: the SSH connection is re-dialed and the action is attempted again, up to `ssh_retry_count` times (default `3`), waiting `ssh_retry_delay` between attempts (default `2s`). Set `ssh_retry_count=0` to disable retries and fail immediately, as before.
-
-Security (TODO ?) note: the SSH implementation currently disables host key verification (`InsecureIgnoreHostKey`). This keeps setup simple but trades away strict host identity checks. If you require stricter security, add host key verification before using remote mode in production.
