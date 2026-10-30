@@ -149,7 +149,7 @@ func (c *Client) readVMConfig(ctx context.Context, vmType string, vmid int) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("unable to read %s config %s: %w", vmType, configPath, err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	configData, err := io.ReadAll(reader)
 	if err != nil {

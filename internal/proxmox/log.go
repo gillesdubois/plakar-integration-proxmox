@@ -31,7 +31,7 @@ var (
 func Warnf(format string, args ...any) {
 	warnMu.Lock()
 	defer warnMu.Unlock()
-	fmt.Fprintf(warnTo, "proxmox: warning: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(warnTo, "proxmox: warning: "+format+"\n", args...)
 }
 
 func SetWarnWriter(w io.Writer) func() {
