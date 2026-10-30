@@ -1,0 +1,31 @@
+# Build outputs (see Makefile)
+/proxmoxImporter
+/proxmoxExporter
+*.exe
+*.ptar
+*.ptar.tmp
+
+# Go
+*.test
+*.out
+coverage.*
+/vendor/
+go.work
+go.work.sum
+
+# Environment / secrets
+.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# AI tooling (Claude Code, Spec Kit)
+.claude/
+CLAUDE.md
+.specify/
+specs/

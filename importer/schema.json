@@ -7,6 +7,12 @@
     "location",
     "mode"
   ],
+  "not": {
+    "required": [
+      "conn_identity_file",
+      "conn_identity_key"
+    ]
+  },
   "properties": {
     "location": {
       "type": "string",
@@ -42,6 +48,11 @@
     "conn_identity_file": {
       "type": "string",
       "description": "Path to private key when conn_method=identity",
+      "minLength": 1
+    },
+    "conn_identity_key": {
+      "type": "string",
+      "description": "Private key content when conn_method=identity, exclusive with conn_identity_file",
       "minLength": 1
     },
     "backup_compression": {
@@ -90,6 +101,16 @@
       "type": "string",
       "description": "Delay between SSH retries when mode=remote, as a Go duration (e.g. \"2s\")",
       "default": "2s"
+    },
+    "ssh_known_hosts": {
+      "type": "string",
+      "description": "Path to the known_hosts file used to verify the Proxmox node host key when mode=remote",
+      "default": "~/.ssh/known_hosts"
+    },
+    "ssh_insecure_ignore_host_key": {
+      "type": "boolean",
+      "description": "Disable host key verification entirely. Leaves the connection open to man-in-the-middle attacks; use only on a trusted network.",
+      "default": false
     },
     "vmid": {
       "type": "integer",

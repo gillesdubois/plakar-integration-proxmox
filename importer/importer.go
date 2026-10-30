@@ -83,11 +83,24 @@ func (p *ProxmoxImporter) Root() string          { return "/" }
 func (p *ProxmoxImporter) Flags() location.Flags { return location.FLAG_STREAM }
 
 func (p *ProxmoxImporter) Ping(ctx context.Context) error {
-	return p.client.Ping(ctx)
+	if err := p.client.Ping(ctx); err != nil {
+		return err
+	}
+	return p.preflight(ctx)
+}
+
+// preflight checks what the whole job depends on before any VM is touched.
+// Dumps are streamed from vzdump's stdout, so dump_dir is not needed here.
+func (p *ProxmoxImporter) preflight(ctx context.Context) error {
+	return p.client.CheckCommands(ctx, "pvesh", "vzdump")
 }
 
 func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors.Record, _ <-chan *connectors.Result) error {
 	defer close(records)
+
+	if err := p.preflight(ctx); err != nil {
+		return err
+	}
 
 	vmids, err := p.resolveVMIDs(ctx)
 	if err != nil {
@@ -97,58 +110,74 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 		return fmt.Errorf("no VM/CT found for selection")
 	}
 
+	var (
+		succeeded int
+		failed    int
+		lastErr   error
+	)
+
 	for _, vmid := range vmids {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		vmType, err := p.client.VMType(ctx, vmid)
-		if err != nil {
-			return err
-		}
-
-		vmName, err := p.client.VMName(ctx, vmid)
-		if err != nil {
-			return err
-		}
-
-		backupRecord, err := p.buildBackupRecord(ctx, vmType, vmid, vmName)
-		if err != nil {
-			return err
-		}
-
-		archivePath := backupRecord.archivePath
-		archiveName := path.Base(archivePath)
-		if isInvalidArchiveName(archiveName) {
-			_ = backupRecord.record.Close()
-			return fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
-		}
-
-		if err := p.emitRecord(ctx, records, backupRecord.record); err != nil {
-			return err
-		}
-
-		if vmType == "qemu" || vmType == "lxc" {
-			if err := p.emitVMConfigRecord(ctx, records, vmType, vmid, vmName, archiveName); err != nil {
+		if err := p.importVM(ctx, records, vmid); err != nil {
+			if ctx.Err() != nil {
 				return err
 			}
-			if err := p.emitVMPoolRecord(ctx, records, vmType, vmid, vmName, archiveName); err != nil {
-				return err
-			}
-		}
 
-		if p.cfg.Cleanup && archivePath != "" && path.IsAbs(archivePath) {
-			if err := p.client.Remove(ctx, archivePath); err != nil {
-				return err
+			// A single locked or broken VM must not throw away the VMs that
+			// backed up fine: report it as a failed entry and carry on.
+			failed++
+			lastErr = err
+			proxmox.Warnf("backup of vmid %d failed: %v", vmid, err)
+
+			failure := connectors.NewError(vmFailurePath(vmid), err)
+			if emitErr := p.emitRecord(ctx, records, failure); emitErr != nil {
+				return emitErr
 			}
+			continue
 		}
+		succeeded++
 	}
 
+	if succeeded == 0 {
+		return fmt.Errorf("all %d VM/CT backup(s) failed, last error: %w", failed, lastErr)
+	}
+	if failed > 0 {
+		proxmox.Warnf("%d of %d VM/CT failed to back up", failed, failed+succeeded)
+	}
 	return nil
 }
 
 func (p *ProxmoxImporter) Close(ctx context.Context) error {
 	return p.client.Close()
+}
+
+func (p *ProxmoxImporter) importVM(ctx context.Context, records chan<- *connectors.Record, vmid int) error {
+	vmType, err := p.client.VMType(ctx, vmid)
+	if err != nil {
+		return err
+	}
+
+	vmName, err := p.client.VMName(ctx, vmid)
+	if err != nil {
+		return err
+	}
+
+	record, archiveName, err := p.buildBackupRecord(ctx, vmType, vmid, vmName)
+	if err != nil {
+		return err
+	}
+
+	if err := p.emitRecord(ctx, records, record); err != nil {
+		return err
+	}
+
+	if err := p.emitVMConfigRecord(ctx, records, vmType, vmid, vmName, archiveName); err != nil {
+		return err
+	}
+	return p.emitVMPoolRecord(ctx, records, vmType, vmid, vmName, archiveName)
 }
 
 func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
@@ -164,47 +193,24 @@ func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
 	}
 }
 
-type backupRecord struct {
-	archivePath string
-	record      *connectors.Record
-}
-
-func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, vmid int, vmName string) (*backupRecord, error) {
-	archivePath, err := p.client.BackupVM(ctx, vmid)
+func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, vmid int, vmName string) (*connectors.Record, string, error) {
+	archiveName, reader, err := p.client.BackupVMStream(ctx, vmType, vmid)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	fileInfo, err := p.client.Stat(ctx, archivePath)
-	if err != nil {
-		return nil, err
-	}
-
-	reader, err := p.client.Open(ctx, archivePath)
-	if err != nil {
-		return nil, err
-	}
-
-	archiveName := path.Base(archivePath)
-	if isInvalidArchiveName(archiveName) {
-		_ = reader.Close()
-		return nil, fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
-	}
-
-	return &backupRecord{
-		archivePath: archivePath,
-		record: &connectors.Record{
-			Pathname: buildBackupSnapshotPath(vmType, vmid, vmName, archiveName),
-			FileInfo: objects.FileInfo{
-				Lname:    archiveName,
-				Lsize:    fileInfo.Size(),
-				Lmode:    0600,
-				LmodTime: fileInfo.ModTime(),
-				Ldev:     1,
-			},
-			Reader: reader,
+	return &connectors.Record{
+		Pathname: buildBackupSnapshotPath(vmType, vmid, vmName, archiveName),
+		FileInfo: objects.FileInfo{
+			Lname: archiveName,
+			// Unknown until the stream ends: kloset records the size it read.
+			Lsize:    -1,
+			Lmode:    0600,
+			LmodTime: time.Now(),
+			Ldev:     1,
 		},
-	}, nil
+		Reader: reader,
+	}, archiveName, nil
 }
 
 func (p *ProxmoxImporter) emitVMConfigRecord(ctx context.Context, records chan<- *connectors.Record, vmType string, vmid int, vmName, archiveName string) error {
@@ -281,8 +287,9 @@ func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connec
 	return nil
 }
 
-func isInvalidArchiveName(name string) bool {
-	return name == "" || name == "." || name == "/"
+// vmFailurePath names the entry reported for a VM that could not be dumped.
+func vmFailurePath(vmid int) string {
+	return path.Join(backupSnapshotRoot, strconv.Itoa(vmid))
 }
 
 func buildBackupSnapshotPath(vmType string, vmid int, vmName, filename string) string {

@@ -30,6 +30,11 @@ type Client struct {
 	cfg    *Config
 	runner Runner
 
+	// vzdumpMu lets one vzdump run at a time. The node allows only one anyway,
+	// and the others would otherwise sit on its global lock, which gives up
+	// after lockwait (3h by default) on a large pool.
+	vzdumpMu sync.Mutex
+
 	resourceCacheMu sync.Mutex
 	resourceCache   []vmResource
 	resourceCacheAt time.Time

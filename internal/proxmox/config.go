@@ -33,6 +33,8 @@ const (
 	DefaultSSHRetryDelay = 2 * time.Second
 )
 
+const DefaultSSHKnownHosts = "~/.ssh/known_hosts"
+
 const (
 	ModeLocal  = "local"
 	ModeRemote = "remote"
@@ -47,18 +49,21 @@ type Config struct {
 	Location *url.URL
 	Host     string
 
-	Mode              string
-	ConnMethod        string
-	ConnUsername      string
-	ConnPassword      string
-	ConnIdentityFile  string
-	DumpDir           string
-	BackupCompression string
-	BackupMode        string
-	Node              string
-	Cleanup           bool
-	SSHRetryCount     int
-	SSHRetryDelay     time.Duration
+	Mode                     string
+	ConnMethod               string
+	ConnUsername             string
+	ConnPassword             string
+	ConnIdentityFile         string
+	ConnIdentityKey          string
+	DumpDir                  string
+	BackupCompression        string
+	BackupMode               string
+	Node                     string
+	Cleanup                  bool
+	SSHRetryCount            int
+	SSHRetryDelay            time.Duration
+	SSHKnownHosts            string
+	SSHInsecureIgnoreHostKey bool
 }
 
 func ParseConfig(config map[string]string) (*Config, error) {
@@ -121,12 +126,18 @@ func ParseConfig(config map[string]string) (*Config, error) {
 			}
 		case ConnMethodIdentity:
 			cfg.ConnIdentityFile = strings.TrimSpace(config["conn_identity_file"])
-			if cfg.ConnIdentityFile == "" {
-				return nil, fmt.Errorf("missing conn_identity_file")
+			cfg.ConnIdentityKey = config["conn_identity_key"]
+			if cfg.ConnIdentityFile != "" && cfg.ConnIdentityKey != "" {
+				return nil, fmt.Errorf("conn_identity_file and conn_identity_key are mutually exclusive")
 			}
-			cfg.ConnIdentityFile, err = expandPath(cfg.ConnIdentityFile)
-			if err != nil {
-				return nil, err
+			if cfg.ConnIdentityFile == "" && cfg.ConnIdentityKey == "" {
+				return nil, fmt.Errorf("missing conn_identity_file or conn_identity_key")
+			}
+			if cfg.ConnIdentityFile != "" {
+				cfg.ConnIdentityFile, err = expandPath(cfg.ConnIdentityFile)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -167,7 +178,31 @@ func ParseConfig(config map[string]string) (*Config, error) {
 	}
 	cfg.SSHRetryDelay = sshRetryDelay
 
+	if err := parseHostKeyConfig(cfg, config); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+func parseHostKeyConfig(cfg *Config, config map[string]string) error {
+	insecure, err := parseBool(config, "ssh_insecure_ignore_host_key", false)
+	if err != nil {
+		return err
+	}
+	cfg.SSHInsecureIgnoreHostKey = insecure
+
+	cfg.SSHKnownHosts = strings.TrimSpace(config["ssh_known_hosts"])
+	if cfg.SSHKnownHosts == "" {
+		cfg.SSHKnownHosts = DefaultSSHKnownHosts
+	}
+
+	if cfg.Mode != ModeRemote {
+		return nil
+	}
+
+	cfg.SSHKnownHosts, err = expandPath(cfg.SSHKnownHosts)
+	return err
 }
 
 func (c *Config) Origin() string {
