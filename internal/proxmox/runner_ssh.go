@@ -265,8 +265,14 @@ func (r *SSHRunner) Stream(ctx context.Context, name string, args ...string) (*C
 		return nil, err
 	}
 
+	// Kills the remote command on cancellation; exits once the command is done
+	// so a long job does not keep one goroutine per streamed VM.
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
 		_ = session.Close()
 	}()
 
@@ -275,7 +281,7 @@ func (r *SSHRunner) Stream(ctx context.Context, name string, args ...string) (*C
 		Stderr: stderr,
 		finish: func() error {
 			err := session.Wait()
-			_ = session.Close()
+			close(done)
 			return err
 		},
 		abort: func() error {
