@@ -25,16 +25,27 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/PlakarKorp/kloset/connectors"
 )
 
 const qemuConfigDir = "/etc/pve/qemu-server"
 const lxcConfigDir = "/etc/pve/lxc"
 
-// BackupVMStream runs vzdump with --stdout and returns the archive name it
-// would have had on disk along with its content; nothing is written to the
-// node. A vzdump failure surfaces as an error from the reader at EOF.
+// BackupVMStream returns the archive name for a VM/CT and a reader over
+// `vzdump --stdout`; nothing is written to the node. A vzdump failure
+// surfaces as an error from the reader at EOF.
+//
+// vzdump only starts on the first Read. Started up front, it would take the
+// node-wide vzdump lock while its record still waits in plakar's queue, and
+// the importer would then block on the next VM's vzdump waiting for that lock.
 func (c *Client) BackupVMStream(ctx context.Context, vmType string, vmid int) (string, io.ReadCloser, error) {
 	baseExt, err := dumpBaseExtension(vmType)
+	if err != nil {
+		return "", nil, err
+	}
+
+	suffix, err := compressionSuffix(c.cfg.BackupCompression)
 	if err != nil {
 		return "", nil, err
 	}
@@ -44,9 +55,20 @@ func (c *Client) BackupVMStream(ctx context.Context, vmType string, vmid int) (s
 		args = append(args, "--node", c.cfg.Node)
 	}
 
+	timestamp := time.Now().Format("2006_01_02-15_04_05")
+	archiveName := BuildDumpFilename(c.cfg, vmType, vmid, timestamp, baseExt, suffix)
+
+	return archiveName, connectors.NewLazyReader(func() (io.ReadCloser, error) {
+		return c.startVzdump(ctx, args)
+	}), nil
+}
+
+func (c *Client) startVzdump(ctx context.Context, args []string) (io.ReadCloser, error) {
+	c.vzdumpMu.Lock()
 	stream, err := c.runner.Stream(ctx, "vzdump", args...)
 	if err != nil {
-		return "", nil, fmt.Errorf("vzdump stream failed: %w", err)
+		c.vzdumpMu.Unlock()
+		return nil, fmt.Errorf("vzdump stream failed: %w", err)
 	}
 
 	stderrBuf := &bytes.Buffer{}
@@ -57,29 +79,11 @@ func (c *Client) BackupVMStream(ctx context.Context, vmType string, vmid int) (s
 		_, _ = io.Copy(stderrBuf, stream.Stderr)
 	}()
 
-	header, err := readStreamHeader(stream.Stdout, 16)
-	if err != nil {
-		_ = stream.Abort()
-		_ = stream.Finish()
-		<-doneCh
-		return "", nil, fmt.Errorf("unable to read vzdump stream header: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
-	}
-	if len(header) == 0 {
-		_ = stream.Abort()
-		_ = stream.Finish()
-		<-doneCh
-		return "", nil, fmt.Errorf("empty vzdump stream header: %s", strings.TrimSpace(stderrBuf.String()))
-	}
-
-	compressionSuffix := detectCompressionSuffix(header)
-	timestamp := time.Now().Format("2006_01_02-15_04_05")
-	archivePath := BuildDumpFilename(c.cfg, vmType, vmid, timestamp, baseExt, compressionSuffix)
-
-	stdout := io.MultiReader(bytes.NewReader(header), stream.Stdout)
-
-	return archivePath, &streamReadCloser{
-		stdout:     stdout,
+	return &streamReadCloser{
+		stdout:     stream.Stdout,
 		finish:     stream.Finish,
+		abort:      stream.Abort,
+		release:    c.vzdumpMu.Unlock,
 		stderr:     stderrBuf,
 		stderrDone: doneCh,
 	}, nil
@@ -135,38 +139,29 @@ func dumpBaseExtension(vmType string) (string, error) {
 	}
 }
 
-func readStreamHeader(reader io.Reader, size int) ([]byte, error) {
-	if size <= 0 {
-		return nil, nil
+// compressionSuffix maps vzdump's --compress value to the archive extension
+// vzdump itself would use.
+func compressionSuffix(compress string) (string, error) {
+	switch compress {
+	case "0":
+		return "", nil
+	case "1", "lzo":
+		return ".lzo", nil
+	case "gzip":
+		return ".gz", nil
+	case "zstd":
+		return ".zst", nil
+	default:
+		return "", fmt.Errorf("unsupported backup_compression: %q", compress)
 	}
-	buf := make([]byte, size)
-	n, err := io.ReadFull(reader, buf)
-	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return buf[:n], nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-func detectCompressionSuffix(header []byte) string {
-	if len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b {
-		return ".gz"
-	}
-	if len(header) >= 4 && header[0] == 0x28 && header[1] == 0xb5 && header[2] == 0x2f && header[3] == 0xfd {
-		return ".zst"
-	}
-	lzoMagic := []byte{0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a}
-	if len(header) >= len(lzoMagic) && bytes.HasPrefix(header, lzoMagic) {
-		return ".lzo"
-	}
-	return ""
 }
 
 type streamReadCloser struct {
 	stdout     io.Reader
 	finish     func() error
+	abort      func() error
+	release    func()
+	eof        bool
 	stderr     *bytes.Buffer
 	stderrDone <-chan struct{}
 	closed     bool
@@ -177,6 +172,7 @@ type streamReadCloser struct {
 func (r *streamReadCloser) Read(p []byte) (int, error) {
 	n, err := r.stdout.Read(p)
 	if err == io.EOF {
+		r.eof = true
 		if finishErr := r.finalize(); finishErr != nil {
 			return n, finishErr
 		}
@@ -189,6 +185,11 @@ func (r *streamReadCloser) Close() error {
 		return nil
 	}
 	r.closed = true
+	// Closed before EOF: vzdump would block writing to a pipe nobody reads,
+	// and waiting for it would never return.
+	if !r.eof && r.abort != nil {
+		_ = r.abort()
+	}
 	return r.finalize()
 }
 
@@ -204,6 +205,9 @@ func (r *streamReadCloser) finalize() error {
 	}
 	if r.stderrDone != nil {
 		<-r.stderrDone
+	}
+	if r.release != nil {
+		r.release()
 	}
 	if err != nil {
 		r.finishErr = fmt.Errorf("vzdump failed: %w: %s", err, strings.TrimSpace(r.stderr.String()))

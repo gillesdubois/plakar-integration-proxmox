@@ -266,7 +266,9 @@ disk on its own:
    Resources the cluster reports with an `unknown` status (node unreachable) are skipped with a
    warning rather than attempted.
 5. For each VM/CT, detect the type (`qemu` or `lxc`) via Proxmox inventory.
-6. For each VM/CT, run `vzdump --stdout`; the compression is detected from the first bytes of the stream.
+6. For each VM/CT, emit the archive record right away; `vzdump --stdout` only starts when Plakar
+   begins reading it. The archive extension follows `backup_compression`. Records are never held
+   back waiting for a dump, so vzdump's node-wide lock cannot stall a multi-VM (`pool`/`all`) job.
 7. Stream vzdump's stdout straight into Plakar (no intermediate file on the node) under `/backup/<type>/<vmid>_<vmname>/` (VM name is sanitized for path safety).
 8. For QEMU and LXC, also export VM config files as sidecars:
    - QEMU: `/etc/pve/qemu-server/<vmid>.conf` as `/backup/qemu/<vmid>_<vmname>/<dump>_qemu.conf`
@@ -277,14 +279,14 @@ disk on its own:
 
 ### Partial failures
 
-A VM/CT that cannot be dumped (locked by a migration, a snapshot in progress, a missing disk, ...)
-does not cancel the run. The failure is reported as a failed entry for that VM/CT, a warning is
-printed on stderr, and the remaining selection is backed up normally. The backup only fails as a
-whole when *every* selected VM/CT failed.
+A VM/CT whose inventory or config cannot be read does not cancel the run. The failure is reported
+as a failed entry for that VM/CT, a warning is printed on stderr, and the remaining selection is
+backed up normally. The backup only fails as a whole when *every* selected VM/CT failed this way.
 
-Most of these failures happen before vzdump writes anything and are counted as above. A vzdump that
-dies *after* it started streaming is reported by Plakar as a read error on that archive instead, and
-does not count towards the "every VM/CT failed" rule.
+vzdump itself only runs once Plakar reads the archive, so a VM/CT that vzdump cannot dump (locked by
+a migration, a snapshot in progress, a missing disk, ...) is reported by Plakar as a read error on
+that archive, with vzdump's stderr in the message. The other VM/CT are still backed up, but these
+errors do not count towards the "every VM/CT failed" rule.
 
 ### Restore Flow (Exporter)
 
