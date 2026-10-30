@@ -35,9 +35,9 @@ The configuration parameters are as follows:
     - `snapshot` : Use a snapshot mode without stopping or suspending VM / CT
     - `suspend` : VM or CT will be suspended during the backup
     - `stop` : Proxmox will stop the VM / CT in order to perform the backup
-- `dump_dir` (optional): Directory used by Proxmox to store dump archives (defaults to `/var/lib/vz/dump`). It is used for restore uploads and for backup generation in both modes.
+- `dump_dir` (optional): Directory used by Proxmox to store dump archives (defaults to `/var/lib/vz/dump`). It is only used for restore uploads: backups are streamed from `vzdump --stdout` and never touch the disk.
 - `node` (optional): Proxmox node to target for restore/upload operations (required if your cluster has multiple nodes)
-- `cleanup` (optional): When `true`, delete temporary vzdump files from Proxmox storage after restore and after backups (defaults to `true`).
+- `cleanup` (optional): When `true`, delete temporary vzdump files from Proxmox storage after restore (defaults to `true`). Backups do not create any.
 - `ssh_retry_count` (optional, only used when `mode=remote`): Number of retries when an SSH action fails to open a channel/session (e.g. `ssh: rejected: connect failed (open failed)` on a stale connection). Defaults to `3`. Set to `0` to disable retries.
 - `ssh_retry_delay` (optional, only used when `mode=remote`): Delay to wait between SSH retries, as a Go duration (e.g. `2s`, `500ms`, `1m`). Defaults to `2s`.
 - `ssh_known_hosts` (optional, only used when `mode=remote`): Path to the `known_hosts` file used to verify the Proxmox node host key (defaults to `~/.ssh/known_hosts`).
@@ -107,7 +107,7 @@ When backing up large virtual machines or containers, temporary files and cache 
 There are two main areas of disk usage to consider:
 
 1. **Proxmox VZDump Temporary Files**:
-   By default, Proxmox creates a temporary dump in the directory configured by `dump_dir` (default: `/var/lib/vz/dump`). If `cleanup` is set to `true` (default), these files are automatically deleted after Plakar finishes importing them.
+   Backups do not use any: `vzdump` writes to stdout and the stream goes straight into Plakar. Restores still upload the archive into `dump_dir` (default: `/var/lib/vz/dump`) before `qmrestore`/`pct restore`; with `cleanup=true` (default) it is deleted afterwards.
 
 2. **Plakar Cache and Stage Packfiles**:
    Plakar stores metadata and indexes in a local cache (by default under `~/.cache/plakar`) and creates temporary "packfiles" on disk during backup operations before sending them to the repository.
@@ -155,7 +155,6 @@ $ plakar source add myProxmoxHypervisorRemote proxmox+backup://10.0.0.10 mode=re
 $ plakar at /tmp/example backup -o vmid=101 @myProxmoxHypervisorSrc
 $ plakar at /tmp/example backup -o pool=prod @myProxmoxHypervisorSrc
 $ plakar at /tmp/example backup -o all @myProxmoxHypervisorSrc 
-$ plakar at /tmp/example backup -o vmid=101 -o cleanup=false @myProxmoxHypervisorSrc 
 
 # Backup VM / CT with custom cache and packfiles paths (redirected to a larger storage)
 $ plakar at /tmp/example backup -cache /mnt/large-disk/cache -packfiles /mnt/large-disk/packfiles -o vmid=101 @myProxmoxHypervisorSrc
@@ -184,56 +183,97 @@ $ plakar at /tmp/example restore -o newid=201 -o storage=local-lvm -o pool=share
 $ plakar at /tmp/example restore -o newid=201 -o unique=false -to @myProxmoxHypervisorRemote <snapid> 
 ``` 
 
-## Proxmox tools / commands used
+## Commands executed on the Proxmox node
 
-This integration relies on Proxmox CLI tooling (`pvesh`, `vzdump`, `qmrestore`, `pct`).
+This chapter lists every command the integration runs on the Proxmox node, and every file it reads or
+writes there. Nothing else is executed.
 
-Commands are executed locally when `mode=local`, and via SSH when `mode=remote`.
+### Execution context
 
-Backup (importer) commands:
-- `pvesh get /version --output-format json`
-- `pvesh get /cluster/resources --type vm --output-format json` (when `all`)
-- `pvesh get /pools/<pool> --output-format json` (when `pool=...`)
-- `vzdump <vmid> --dumpdir <dump_dir> --mode <snapshot|suspend|stop> --compress <0|1|lzo|gzip|zstd> [--node <node>]` (when `mode=local` and `mode=remote`)
-- `cat -- /etc/pve/qemu-server/<vmid>.conf` (for QEMU sidecar config file)
-- `cat -- /etc/pve/lxc/<vmid>.conf` (for LXC sidecar config file)
-- `sh -c 'command -v <tool>'` and `test -d`/`test -w <dump_dir>` (preflight, before any VM is touched)
-- `rm -f -- <dump_dir>/<archive>` and `rm -f -- <dump_dir>/<basename>.log` (when `cleanup=true`)
+- `mode=remote`: one SSH connection to `location` as `conn_username` (host key checked against
+  `ssh_known_hosts` unless `ssh_insecure_ignore_host_key=true`). Each command runs in its own SSH
+  session on that connection. Every argument is single-quoted, so no value (VM name, path, pool, ...)
+  is ever interpreted by the remote shell.
+- `mode=local`: commands are started directly by the Plakar process, as the user running Plakar.
+  File reads, writes and removals are done in-process: the `cat`, `cat >` and `rm` lines below
+  only exist in `mode=remote`.
+- `vzdump`, `qm`, `pct`, `qmrestore` and `pvesh` refuse to run unless they are executed as root
+  (`please run as root`). The integration does not prefix them with `sudo`.
 
-Restore (exporter) commands:
-- `sh -c 'command -v <tool>'` and `test -d`/`test -w <dump_dir>` (preflight, before any upload)
-- `df -Pk <dump_dir>` (free space check, before each archive is uploaded)
-- `cat > <dump_dir>/<archive>` (write archive to Proxmox storage)
-- `qm status <vmid>` / `pct status <vmid>` (check existence and running state)
-- `pvesh get /pools/<pool> --output-format json` (only when a `_pool.conf` sidecar is present)
-- `qmrestore <dump_dir>/<archive> <vmid> [--force] [--unique] [--storage <storage>] [--pool <pool>]` (QEMU)
-- `pct restore <vmid> <dump_dir>/<archive> [--force] [--unique] [--storage <storage>] [--pool <pool>]` (LXC)
-- `qm set <vmid> --smbios1 uuid=<new-uuid>,...` (QEMU only, when `unique` applies)
-- `qm stop <vmid>` / `pct stop <vmid>` (when `-o force_vm_restore=true` and the VM/CT is running)
-- `qm start <vmid>` / `pct start <vmid>` (only when `-o start_on_restore=true`)
-- `rm -f -- <dump_dir>/<archive>` and `rm -f -- <dump_dir>/<basename>.log` (when `cleanup=true`)
+### Connection check (`plakar source ping` / `plakar destination ping`, and start of every job)
+
+| Command | Purpose |
+|---|---|
+| `pvesh get /version --output-format json` | Proxmox reachable and `pvesh` working |
+
+### Backup (importer)
+
+| Command | When | Purpose |
+|---|---|---|
+| `sh -c 'command -v pvesh >/dev/null 2>&1'` | start of the job | preflight: tool present |
+| `sh -c 'command -v vzdump >/dev/null 2>&1'` | start of the job | preflight: tool present |
+| `pvesh get /pools/<pool> --output-format json` | `pool=<pool>` | list the VM/CT of the pool |
+| `pvesh get /cluster/resources --type vm --output-format json` | once per job (cached) | VM/CT list for `all`, and type / name / pool of every VM/CT |
+| `vzdump <vmid> --stdout --mode <backup_mode> --compress <backup_compression> [--node <node>]` | once per VM/CT | dump streamed on stdout straight into Plakar |
+| `cat -- /etc/pve/qemu-server/<vmid>.conf` | QEMU VM, `mode=remote` | `_qemu.conf` sidecar |
+| `cat -- /etc/pve/lxc/<vmid>.conf` | LXC CT, `mode=remote` | `_lxc.conf` sidecar |
+
+### Restore (exporter)
+
+| Command | When | Purpose |
+|---|---|---|
+| `sh -c 'command -v <tool> >/dev/null 2>&1'` for `pvesh`, `qm`, `pct`, `qmrestore` | start of the job | preflight: tools present |
+| `test -d <dump_dir>` / `test -w <dump_dir>` | start of the job | preflight: `dump_dir` exists and is writable |
+| `df -Pk <dump_dir>` | before each archive upload | enough free space for the archive |
+| `cat > <dump_dir>/<archive>` | each archive, `mode=remote` | upload the archive to the node |
+| `qm status <vmid>` / `pct status <vmid>` | each archive | target exists? running? |
+| `pvesh get /pools/<pool> --output-format json` | `_pool.conf` sidecar present, or `pool` option set | the pool exists |
+| `qm stop <vmid>` / `pct stop <vmid>` | `force_vm_restore=true` and target running | stop before overwrite |
+| `qmrestore <dump_dir>/<archive> <vmid> [--force] [--unique] [--storage <storage>] [--pool <pool>]` | QEMU archive | restore |
+| `pct restore <vmid> <dump_dir>/<archive> [--force] [--unique] [--storage <storage>] [--pool <pool>]` | LXC archive | restore |
+| `qm set <vmid> --smbios1 uuid=<new-uuid>,...` | QEMU, when a new identity applies | new SMBIOS UUID |
+| `qm start <vmid>` / `pct start <vmid>` | `start_on_restore=true` | start after restore |
+| `rm -f -- <dump_dir>/<archive>` and `rm -f -- <dump_dir>/<basename>.log` | `cleanup=true`, `mode=remote` | remove the uploaded archive and its vzdump log |
+
+### Files touched on the node
+
+| Path | Access | Operation |
+|---|---|---|
+| `/etc/pve/qemu-server/<vmid>.conf` | read | backup (QEMU) |
+| `/etc/pve/lxc/<vmid>.conf` | read | backup (LXC) |
+| `<dump_dir>/<archive>` | write, then remove (`cleanup=true`) | restore |
+| `<dump_dir>/<basename>.log` | remove (`cleanup=true`) | restore |
+
+The integration itself writes nothing on the node during a backup. `vzdump`, however, still uses the
+disk on its own:
+
+- it creates a working directory `<dump_dir>/vzdump-<type>-<vmid>-<timestamp>.tmp` (VM config only, a
+  few KB), which it removes at the end;
+- it writes its log to `<dump_dir>/vzdump-<type>-<vmid>-<timestamp>.log` and leaves it there;
+- for LXC, when `dump_dir` is on ZFS (and in `backup_mode=suspend`), it uses a temporary directory
+  under `/var/tmp` (e.g. `/var/tmp/vzdumptmp<pid>_<vmid>`);
+- it sends the usual end-of-job notification configured on the node.
 
 ## Technical / code overview 
 
 ### Backup Flow (Importer)
 
 1. Read config and validate options (local/remote mode, SSH auth, compression, backup mode, node, etc.).
-2. Preflight the target: required Proxmox tools are present, `dump_dir` exists and is writable.
+2. Preflight the target: required Proxmox tools are present.
 3. Resolve VM/CT selection: `vmid`, `pool`, or `all`.
 4. Retrieve the list via `pvesh`:
    `pvesh get /cluster/resources --type vm` or `pvesh get /pools/<pool>`.
    Resources the cluster reports with an `unknown` status (node unreachable) are skipped with a
    warning rather than attempted.
 5. For each VM/CT, detect the type (`qemu` or `lxc`) via Proxmox inventory.
-6. For each VM/CT, run `vzdump` to generate a dump file in `dump_dir`.
-7. Read the dump file and send it to Plakar under `/backup/<type>/<vmid>_<vmname>/` (VM name is sanitized for path safety).
+6. For each VM/CT, run `vzdump --stdout`; the compression is detected from the first bytes of the stream.
+7. Stream vzdump's stdout straight into Plakar (no intermediate file on the node) under `/backup/<type>/<vmid>_<vmname>/` (VM name is sanitized for path safety).
 8. For QEMU and LXC, also export VM config files as sidecars:
    - QEMU: `/etc/pve/qemu-server/<vmid>.conf` as `/backup/qemu/<vmid>_<vmname>/<dump>_qemu.conf`
    - LXC: `/etc/pve/lxc/<vmid>.conf` as `/backup/lxc/<vmid>_<vmname>/<dump>_lxc.conf`
 9. If VM/CT belongs to a pool, export pool membership as `/backup/<type>/<vmid>_<vmname>/<dump>_pool.conf` (content is the pool name).
-10. `cleanup` option: the generated dump file, and the `.log` vzdump writes next to it, are removed
-    from `dump_dir` (enabled by default). Removal happens once Plakar is done reading the archive,
-    and on failure paths too, so a job that keeps failing does not fill up `dump_dir`.
+10. A vzdump failure in the middle of the stream makes Plakar's read of that archive fail, with
+    vzdump's stderr in the error.
 
 ### Partial failures
 
@@ -241,6 +281,10 @@ A VM/CT that cannot be dumped (locked by a migration, a snapshot in progress, a 
 does not cancel the run. The failure is reported as a failed entry for that VM/CT, a warning is
 printed on stderr, and the remaining selection is backed up normally. The backup only fails as a
 whole when *every* selected VM/CT failed.
+
+Most of these failures happen before vzdump writes anything and are counted as above. A vzdump that
+dies *after* it started streaming is reported by Plakar as a read error on that archive instead, and
+does not count towards the "every VM/CT failed" rule.
 
 ### Restore Flow (Exporter)
 
