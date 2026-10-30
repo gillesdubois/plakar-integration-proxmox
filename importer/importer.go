@@ -36,7 +36,6 @@ import (
 type ProxmoxImporter struct {
 	cfg       *proxmox.Config
 	client    *proxmox.Client
-	temp      *proxmox.TempFiles
 	selection selection
 }
 
@@ -74,7 +73,6 @@ func NewProxmoxImporter(ctx context.Context, opts *connectors.Options, name stri
 	return &ProxmoxImporter{
 		cfg:       cfg,
 		client:    client,
-		temp:      proxmox.NewTempFiles(client, cfg.Cleanup),
 		selection: selection,
 	}, nil
 }
@@ -92,20 +90,13 @@ func (p *ProxmoxImporter) Ping(ctx context.Context) error {
 }
 
 // preflight checks what the whole job depends on before any VM is touched.
+// Dumps are streamed from vzdump's stdout, so dump_dir is not needed here.
 func (p *ProxmoxImporter) preflight(ctx context.Context) error {
-	if err := p.client.CheckCommands(ctx, "pvesh", "vzdump"); err != nil {
-		return err
-	}
-	return p.client.CheckDumpDir(ctx)
+	return p.client.CheckCommands(ctx, "pvesh", "vzdump")
 }
 
 func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors.Record, _ <-chan *connectors.Result) error {
 	defer close(records)
-
-	// Anything still tracked here was left behind by a failure: the archives
-	// handed to plakar have been adopted by their reader and are gone from the
-	// tracking set.
-	defer p.temp.Sweep(ctx)
 
 	if err := p.preflight(ctx); err != nil {
 		return err
@@ -160,7 +151,6 @@ func (p *ProxmoxImporter) Import(ctx context.Context, records chan<- *connectors
 }
 
 func (p *ProxmoxImporter) Close(ctx context.Context) error {
-	p.temp.Sweep(ctx)
 	return p.client.Close()
 }
 
@@ -204,29 +194,7 @@ func (p *ProxmoxImporter) resolveVMIDs(ctx context.Context) ([]int, error) {
 }
 
 func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, vmid int, vmName string) (*connectors.Record, string, error) {
-	archivePath, err := p.client.BackupVM(ctx, vmid)
-	if err != nil {
-		return nil, "", err
-	}
-	if !path.IsAbs(archivePath) {
-		return nil, "", fmt.Errorf("vzdump returned a non-absolute archive path for vmid %d: %q", vmid, archivePath)
-	}
-
-	// Tracked before anything can go wrong with it, so every failure below
-	// still gets the archive removed from the node.
-	p.temp.Track(archivePath)
-
-	archiveName := path.Base(archivePath)
-	if isInvalidArchiveName(archiveName) {
-		return nil, "", fmt.Errorf("invalid archive name for vmid %d: %q", vmid, archiveName)
-	}
-
-	fileInfo, err := p.client.Stat(ctx, archivePath)
-	if err != nil {
-		return nil, "", err
-	}
-
-	reader, err := p.client.Open(ctx, archivePath)
+	archiveName, reader, err := p.client.BackupVMStream(ctx, vmType, vmid)
 	if err != nil {
 		return nil, "", err
 	}
@@ -234,15 +202,14 @@ func (p *ProxmoxImporter) buildBackupRecord(ctx context.Context, vmType string, 
 	return &connectors.Record{
 		Pathname: buildBackupSnapshotPath(vmType, vmid, vmName, archiveName),
 		FileInfo: objects.FileInfo{
-			Lname:    archiveName,
-			Lsize:    fileInfo.Size(),
+			Lname: archiveName,
+			// Unknown until the stream ends: kloset records the size it read.
+			Lsize:    -1,
 			Lmode:    0600,
-			LmodTime: fileInfo.ModTime(),
+			LmodTime: time.Now(),
 			Ldev:     1,
 		},
-		// The archive outlives this function: plakar streams it after the
-		// record has been emitted, so removal is tied to the reader's Close.
-		Reader: p.temp.Adopt(ctx, archivePath, reader),
+		Reader: reader,
 	}, archiveName, nil
 }
 
@@ -318,10 +285,6 @@ func (p *ProxmoxImporter) emitRecord(ctx context.Context, records chan<- *connec
 	case records <- record:
 	}
 	return nil
-}
-
-func isInvalidArchiveName(name string) bool {
-	return name == "" || name == "." || name == "/"
 }
 
 // vmFailurePath names the entry reported for a VM that could not be dumped.

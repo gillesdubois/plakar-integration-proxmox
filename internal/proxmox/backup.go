@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -31,41 +30,13 @@ import (
 const qemuConfigDir = "/etc/pve/qemu-server"
 const lxcConfigDir = "/etc/pve/lxc"
 
-func (c *Client) BackupVM(ctx context.Context, vmid int) (string, error) {
-	args := []string{strconv.Itoa(vmid), "--dumpdir", c.cfg.DumpDir, "--mode", c.cfg.BackupMode, "--compress", c.cfg.BackupCompression}
-	if c.cfg.Node != "" {
-		args = append(args, "--node", c.cfg.Node)
-	}
-
-	stdout, stderr, err := c.runner.Run(ctx, "vzdump", args...)
-	if err != nil {
-		return "", fmt.Errorf("vzdump failed: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	archive := parseArchivePath(stdout + "\n" + stderr)
-	if archive != "" {
-		return archive, nil
-	}
-
-	fallback, err := c.findLatestDump(ctx, vmid)
-	if err != nil {
-		return "", err
-	}
-	if fallback == "" {
-		return "", fmt.Errorf("unable to determine vzdump output file")
-	}
-	return fallback, nil
-}
-
-func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadCloser, *int64, error) {
-	vmType, err := c.VMType(ctx, vmid)
-	if err != nil {
-		return "", nil, nil, err
-	}
-
+// BackupVMStream runs vzdump with --stdout and returns the archive name it
+// would have had on disk along with its content; nothing is written to the
+// node. A vzdump failure surfaces as an error from the reader at EOF.
+func (c *Client) BackupVMStream(ctx context.Context, vmType string, vmid int) (string, io.ReadCloser, error) {
 	baseExt, err := dumpBaseExtension(vmType)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, err
 	}
 
 	args := []string{strconv.Itoa(vmid), "--stdout", "--mode", c.cfg.BackupMode, "--compress", c.cfg.BackupCompression}
@@ -75,7 +46,7 @@ func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadC
 
 	stream, err := c.runner.Stream(ctx, "vzdump", args...)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("vzdump stream failed: %w", err)
+		return "", nil, fmt.Errorf("vzdump stream failed: %w", err)
 	}
 
 	stderrBuf := &bytes.Buffer{}
@@ -91,13 +62,13 @@ func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadC
 		_ = stream.Abort()
 		_ = stream.Finish()
 		<-doneCh
-		return "", nil, nil, fmt.Errorf("unable to read vzdump stream header: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+		return "", nil, fmt.Errorf("unable to read vzdump stream header: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
 	}
 	if len(header) == 0 {
 		_ = stream.Abort()
 		_ = stream.Finish()
 		<-doneCh
-		return "", nil, nil, fmt.Errorf("empty vzdump stream header: %s", strings.TrimSpace(stderrBuf.String()))
+		return "", nil, fmt.Errorf("empty vzdump stream header: %s", strings.TrimSpace(stderrBuf.String()))
 	}
 
 	compressionSuffix := detectCompressionSuffix(header)
@@ -106,18 +77,12 @@ func (c *Client) BackupVMStream(ctx context.Context, vmid int) (string, io.ReadC
 
 	stdout := io.MultiReader(bytes.NewReader(header), stream.Stdout)
 
-	size := int64(0)
-	reader := &countingReadCloser{
-		count: &size,
-		reader: &streamReadCloser{
-			stdout:     stdout,
-			finish:     stream.Finish,
-			stderr:     stderrBuf,
-			stderrDone: doneCh,
-		},
-	}
-
-	return archivePath, reader, &size, nil
+	return archivePath, &streamReadCloser{
+		stdout:     stdout,
+		finish:     stream.Finish,
+		stderr:     stderrBuf,
+		stderrDone: doneCh,
+	}, nil
 }
 
 func (c *Client) ReadQEMUConfig(ctx context.Context, vmid int) ([]byte, error) {
@@ -157,16 +122,6 @@ func (c *Client) readVMConfig(ctx context.Context, vmType string, vmid int) ([]b
 	}
 
 	return configData, nil
-}
-
-var archiveRegex = regexp.MustCompile(`(?m)creating (?:vzdump )?archive ['"]([^'"]+)['"]`)
-
-func parseArchivePath(output string) string {
-	matches := archiveRegex.FindStringSubmatch(output)
-	if len(matches) < 2 {
-		return ""
-	}
-	return strings.TrimSpace(matches[1])
 }
 
 func dumpBaseExtension(vmType string) (string, error) {
@@ -254,56 +209,4 @@ func (r *streamReadCloser) finalize() error {
 		r.finishErr = fmt.Errorf("vzdump failed: %w: %s", err, strings.TrimSpace(r.stderr.String()))
 	}
 	return r.finishErr
-}
-
-type countingReadCloser struct {
-	reader io.ReadCloser
-	count  *int64
-}
-
-func (c *countingReadCloser) Read(p []byte) (int, error) {
-	n, err := c.reader.Read(p)
-	if c.count != nil && n > 0 {
-		*c.count += int64(n)
-	}
-	return n, err
-}
-
-func (c *countingReadCloser) Close() error {
-	return c.reader.Close()
-}
-
-func (c *Client) findLatestDump(ctx context.Context, vmid int) (string, error) {
-	stdout, stderr, err := c.runner.Run(ctx, "ls", "-1", "--", c.cfg.DumpDir)
-	if err != nil {
-		return "", fmt.Errorf("fallback listing failed: %w: %s", err, strings.TrimSpace(stderr))
-	}
-
-	var (
-		bestPath string
-		bestTime time.Time
-	)
-
-	for _, name := range strings.Split(strings.TrimSpace(stdout), "\n") {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		if !isArchiveForVM(name, vmid) {
-			continue
-		}
-
-		fullPath := path.Join(c.cfg.DumpDir, name)
-		info, err := c.runner.Stat(ctx, fullPath)
-		if err != nil {
-			continue
-		}
-		modTime := info.ModTime()
-		if bestPath == "" || modTime.After(bestTime) {
-			bestPath = fullPath
-			bestTime = modTime
-		}
-	}
-
-	return bestPath, nil
 }

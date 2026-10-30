@@ -33,7 +33,6 @@ const PoolSidecarSuffix = "_pool.conf"
 
 var dumpNameRegex = regexp.MustCompile(`^vzdump(?:-v(\d+))?-(qemu|lxc)-(\d+)-`)
 
-var archiveNameTemplate = `^vzdump(?:-v\d+)?-(qemu|lxc)-%d-.*\.(vma|tar)(\..+)?$`
 var archiveSuffixRegex = regexp.MustCompile(`^\.(vma|tar)(\.[a-z0-9]+)?$`)
 
 func ParseDumpFilename(name string) (string, int, error) {
@@ -59,12 +58,6 @@ func ParseDumpFilename(name string) (string, int, error) {
 		return "", 0, fmt.Errorf("invalid vmid in filename: %s", base)
 	}
 	return matches[2], vmid, nil
-}
-
-func isArchiveForVM(name string, vmid int) bool {
-	pattern := fmt.Sprintf(archiveNameTemplate, vmid)
-	re := regexp.MustCompile(pattern)
-	return re.MatchString(name)
 }
 
 func BuildDumpFilename(_ *Config, vmType string, vmid int, timestamp, baseExt, compressionSuffix string) string {
