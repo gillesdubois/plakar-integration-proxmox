@@ -13,6 +13,7 @@ all: build
 build:
 	${GO} build -v -o proxmoxImporter${EXT} ./plugin/importer
 	${GO} build -v -o proxmoxExporter${EXT} ./plugin/exporter
+	${GO} build -v -o proxmoxInventory${EXT} ./plugin/inventory
 
 test:
 	${GO} vet ./...
@@ -31,6 +32,6 @@ install: package
 reinstall: uninstall install
 
 clean:
-	rm -f proxmoxImporter proxmoxExporter proxmox_*.ptar
+	rm -f proxmoxImporter proxmoxExporter proxmoxInventory proxmox_*.ptar
 
 .PHONY: all build test package uninstall install reinstall clean

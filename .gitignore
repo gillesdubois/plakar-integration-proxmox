@@ -1,6 +1,7 @@
 # Build outputs (see Makefile)
 /proxmoxImporter
 /proxmoxExporter
+/proxmoxInventory
 *.exe
 *.ptar
 *.ptar.tmp

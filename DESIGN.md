@@ -89,6 +89,20 @@ the data takes room. Plakar then:
 
 Afterwards the images and session are removed.
 
+## Inventory
+
+The inventory talks to the Proxmox HTTP API with an API token. It makes two calls, both before
+sending anything, so a failure never leaves a partial inventory:
+
+1. `/cluster/status` gives the cluster name, which scopes the URNs (the node name on a standalone
+   host, which has no cluster entry), and each node's IP.
+2. `/cluster/resources?type=vm` gives the guests. Templates are skipped.
+
+Plakman fills a new connector's options from the endpoint attributes, so each guest carries `vmid`
+and `node`, which are importer options. Its endpoint is its node's IP, because vzdump only backs up
+the guests of the node it runs on. `mode` is not set: the backup may run from an edge on the node or
+over SSH.
+
 ## Cancellation
 
 A cancelled job sends SIGTERM to the command running on the node (`session.Signal` over SSH, since

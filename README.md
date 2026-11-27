@@ -1,7 +1,7 @@
 # Proxmox Integration
 
-Back up Proxmox VE virtual machines (QEMU) and containers (LXC) with Plakar, and restore them
-to a Proxmox node.
+Back up Proxmox VE virtual machines (QEMU) and containers (LXC) with Plakar, restore them
+to a Proxmox node, and list them as an inventory.
 
 ## Install
 
@@ -120,6 +120,49 @@ Advanced:
 
 Dumps are never compressed by Proxmox: Plakar deduplicates and compresses them itself.
 
+## Inventory
+
+The `proxmox-inventory` connector lists the QEMU VMs and LXC containers of a Proxmox host or
+cluster through the Proxmox API, so each can be backed up with the importer. Templates are not
+listed. Guests on an unreachable node are, with the `status=unknown` tag.
+
+It is meant for the Plakar control plane: add the inventory there, and each guest shows up as a
+resource to protect, with the importer options below already filled in.
+
+It authenticates with an API token. The `PVEAuditor` role on `/` is enough:
+
+```bash
+$ pveum user add plakar@pve
+$ pveum acl modify / --users plakar@pve --roles PVEAuditor
+$ pveum user token add plakar@pve inventory --privsep 0
+```
+
+| Option | Required | Description |
+|---|---|---|
+| `location` | yes | API address: `https://host[:port][/prefix]` (port `443` by default, prefix for a reverse proxy), or `host[:port]` (port `8006` by default) |
+| `token_id` | yes | token ID, e.g. `plakar@pve!inventory` |
+| `token_secret` | yes | token secret, shown once by `pveum user token add` |
+| `tls_insecure` | no | `true` to skip certificate verification, for the self-signed certificate Proxmox ships with |
+
+Each guest has:
+
+- the URN `urn:proxmox:<cluster>:<qemu|lxc>:<vmid>`, where `<cluster>` is the node name on a
+  standalone host. Joining a node to a cluster, or renaming the cluster, changes the URNs;
+- its node's IP as endpoint, which becomes the importer's `location`, since a backup must run on
+  the guest's node. It is the cluster network IP, which may not be reachable from Plakar. Without
+  an IP, the node name is used instead;
+- the `vmid` and `node` importer options, filled in when the control plane creates the guest's
+  importer. `mode` and the SSH options are still to set;
+- the guest's Proxmox tags, plus `pool=`, `type=` and `status=`.
+
+Proxmox tags cannot hold `:`, so the Plakar environment and data class tags are written with
+dashes and translated:
+
+| Proxmox tag | Plakar tag |
+|---|---|
+| `plakar-environment-<name>`, `plakar-env-<name>` | `plakar:environment:<name>` |
+| `plakar-data-class-<name>`, `plakar-dataclass-<name>`, `plakar-class-<name>` | `plakar:data-class:<name>` |
+
 ## Snapshot layout
 
 ```
@@ -141,4 +184,4 @@ Dumps are never compressed by Proxmox: Plakar deduplicates and compresses them i
 ## Further reading
 
 - [COMMANDS.md](COMMANDS.md): every command run and file touched on the node.
-- [DESIGN.md](DESIGN.md): how backups and restores work inside.
+- [DESIGN.md](DESIGN.md): how backups, restores and the inventory work inside.

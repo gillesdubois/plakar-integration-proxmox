@@ -1,6 +1,6 @@
 name: proxmox
 display_name: Proxmox
-description: Integration providing import and export capabilities for Proxmox.
+description: Integration providing import, export and inventory capabilities for Proxmox.
 homepage: https://github.com/gillesdubois/plakar-integration-proxmox
 license: ISC
 api_version: v1.1.0
@@ -21,5 +21,13 @@ connectors:
   license: ISC
   protocols: [proxmox+backup]
   validator: ./exporter/schema.json
+  class: hypervisor
+  subclass: proxmox
+- type: inventory
+  executable: proxmoxInventory
+  homepage: https://github.com/gillesdubois/plakar-integration-proxmox
+  license: ISC
+  protocols: [proxmox-inventory]
+  validator: ./inventory/schema.json
   class: hypervisor
   subclass: proxmox

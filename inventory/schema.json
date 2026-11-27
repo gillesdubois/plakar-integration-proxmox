@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plakar Proxmox Inventory Connector Config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "location",
+    "token_id",
+    "token_secret"
+  ],
+  "properties": {
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Proxmox API address: https://host[:port][/prefix] (port 443 by default, prefix for a reverse proxy), or host[:port] (port 8006 by default)"
+    },
+    "token_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "API token ID, as user@realm!tokenname"
+    },
+    "token_secret": {
+      "type": "string",
+      "minLength": 1,
+      "description": "API token secret"
+    },
+    "tls_insecure": {
+      "type": "boolean",
+      "description": "Skip TLS certificate verification, for self-signed certificates",
+      "default": false
+    }
+  }
+}
